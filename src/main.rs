@@ -228,7 +228,7 @@ fn main() -> io::Result<()> {
         .unwrap_or_else(|| env_or_path("RALPH_LOG", default_log));
     let stop_token = args
         .stop_token
-        .unwrap_or_else(|| env_or("RALPH_STOP_TOKEN", "<promise>COMPLETE</promise>"));
+        .unwrap_or_else(|| env_or("RALPH_STOP_TOKEN", "__RALPH_DONE__"));
     let prompt_flag = args
         .prompt_flag
         .unwrap_or_else(|| env_or("RALPH_PROMPT_FLAG", "-p"));
