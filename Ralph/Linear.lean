@@ -25,8 +25,8 @@ structure LinearSync where
   doc : LinearDoc
   deriving Repr
 
-private def runGit (args : Array String) : IO (Option String) := do
-  let out ← IO.Process.output { cmd := "git", args } none
+private def runGit (args : Array String) (cwd? : Option System.FilePath := none) : IO (Option String) := do
+  let out ← IO.Process.output { cmd := "git", args, cwd := cwd? } none
   if out.exitCode == 0 then
     return some out.stdout.trimAscii.toString
   return none
@@ -204,8 +204,14 @@ def syncLinearPRD (opts : Options) : IO (Option LinearSync) := do
     return none
   let token? ← linearToken
   let some token := token? | return none
-  let repoName := (← IO.currentDir).fileName.getD "repo"
-  let repoUrl? ← runGit #["remote", "get-url", "origin"]
+  let repoRoot? ← runGit #["rev-parse", "--show-toplevel"]
+  let repoRootPath := repoRoot?.map System.FilePath.mk
+  let cwd ← IO.currentDir
+  let repoName :=
+    match repoRootPath with
+    | some root => root.fileName.getD "repo"
+    | none => cwd.fileName.getD "repo"
+  let repoUrl? ← runGit #["remote", "get-url", "origin"] repoRootPath
   let projects ← queryProjects token
   let some project := findProject projects repoName repoUrl? | return none
   let docs ← queryDocs token project.id
