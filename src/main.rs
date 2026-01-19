@@ -9,16 +9,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Parser, Debug)]
 #[command(name = "ralph", about = "Permissive Ralph loop runner")]
 struct Args {
-    #[arg(long)]
-    runner: Option<String>,
-    #[arg(long)]
-    model: Option<String>,
-    #[arg(long, value_name = "EFFORT")]
-    reasoning_effort: Option<String>,
-    #[arg(long)]
-    iterations: Option<u32>,
-    #[arg(long)]
-    sleep: Option<u64>,
+    #[arg(long, default_value = "codex")]
+    runner: String,
+    #[arg(long, default_value = "gpt-5.2-codex")]
+    model: String,
+    #[arg(long, value_name = "EFFORT", default_value = "xhigh")]
+    reasoning_effort: String,
+    #[arg(long, default_value_t = 24)]
+    iterations: u32,
+    #[arg(long, default_value_t = 15)]
+    sleep: u64,
     #[arg(long)]
     prompt_template: Option<PathBuf>,
     #[arg(long)]
@@ -29,10 +29,10 @@ struct Args {
     log: Option<PathBuf>,
     #[arg(long)]
     no_log: bool,
-    #[arg(long)]
-    stop_token: Option<String>,
-    #[arg(long)]
-    prompt_flag: Option<String>,
+    #[arg(long, default_value = "__RALPH_DONE__")]
+    stop_token: String,
+    #[arg(long, default_value = "-p")]
+    prompt_flag: String,
     #[arg(long, action = clap::ArgAction::Append)]
     runner_arg: Vec<String>,
     #[arg(long)]
@@ -45,26 +45,8 @@ struct Args {
     no_yolo: bool,
 }
 
-fn env_or(name: &str, fallback: &str) -> String {
-    env::var(name).unwrap_or_else(|_| fallback.to_string())
-}
-
 fn env_or_path(name: &str, fallback: PathBuf) -> PathBuf {
     env::var(name).map(PathBuf::from).unwrap_or(fallback)
-}
-
-fn env_or_u32(name: &str, fallback: u32) -> u32 {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(fallback)
-}
-
-fn env_or_u64(name: &str, fallback: u64) -> u64 {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(fallback)
 }
 
 fn load_prompt(template_path: &Path, prd_path: &Path, progress_path: &Path) -> io::Result<String> {
@@ -203,19 +185,11 @@ fn main() -> io::Result<()> {
     let default_template = cwd.join("ralph/prompt-template.md");
     let default_log = cwd.join("ralph/overnight.log");
 
-    let runner = args
-        .runner
-        .unwrap_or_else(|| env_or("RALPH_RUNNER", "codex"));
-    let model = args
-        .model
-        .unwrap_or_else(|| env_or("RALPH_MODEL", "gpt-5.2-codex"));
-    let reasoning_effort = args
-        .reasoning_effort
-        .unwrap_or_else(|| env_or("RALPH_EFFORT", "xhigh"));
-    let iterations = args
-        .iterations
-        .unwrap_or_else(|| env_or_u32("RALPH_ITERATIONS", 24));
-    let sleep_secs = args.sleep.unwrap_or_else(|| env_or_u64("RALPH_SLEEP", 15));
+    let runner = args.runner;
+    let model = args.model;
+    let reasoning_effort = args.reasoning_effort;
+    let iterations = args.iterations;
+    let sleep_secs = args.sleep;
     let prompt_template = args
         .prompt_template
         .unwrap_or_else(|| env_or_path("RALPH_PROMPT_TEMPLATE", default_template));
@@ -226,12 +200,8 @@ fn main() -> io::Result<()> {
     let log_path = args
         .log
         .unwrap_or_else(|| env_or_path("RALPH_LOG", default_log));
-    let stop_token = args
-        .stop_token
-        .unwrap_or_else(|| env_or("RALPH_STOP_TOKEN", "__RALPH_DONE__"));
-    let prompt_flag = args
-        .prompt_flag
-        .unwrap_or_else(|| env_or("RALPH_PROMPT_FLAG", "-p"));
+    let stop_token = args.stop_token;
+    let prompt_flag = args.prompt_flag;
 
     if !prompt_template.is_file() {
         return Err(io::Error::new(
