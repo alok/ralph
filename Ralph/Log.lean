@@ -12,10 +12,10 @@ def appendLog (logPath : System.FilePath) (iteration : Nat) (out err : String) (
   | none => pure ()
   let handle ← IO.FS.Handle.mk logPath .append
   handle.putStrLn s!"[iteration {iteration}]"
-  if out.trim != "" then
+  if out.trimAscii.toString != "" then
     handle.putStrLn "\n[stdout]"
     handle.putStr out
-  if err.trim != "" then
+  if err.trimAscii.toString != "" then
     handle.putStrLn "\n[stderr]"
     handle.putStr err
   handle.putStrLn s!"\n[exit-code] {exitCode}"

@@ -20,6 +20,7 @@ structure Options where
   resumeId : Option String := none
   fullAuto : Bool := false
   noYolo : Bool := false
+  noLinear : Bool := false
   deriving Repr
 
 /-- Fill in default paths relative to `cwd/ralph/` when none are provided. -/

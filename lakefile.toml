@@ -2,6 +2,11 @@ name = "ralph"
 version = "0.1.0"
 defaultTargets = ["ralph"]
 
+[[require]]
+name = "Cli"
+git = "https://github.com/leanprover/lean4-cli"
+rev = "main"
+
 [[lean_lib]]
 name = "Ralph"
 
