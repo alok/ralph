@@ -142,6 +142,12 @@ fn default_template_content() -> String {
         "## Acceptance Criteria",
         "- [ ] ...",
         "",
+        "## Cycle Plan (Linear)",
+        "- Current/next cycle scope (if available): ...",
+        "",
+        "## Fringe (out-of-cycle ideas)",
+        "- Ideas to consider later or park for now: ...",
+        "",
         "## Tasks",
         "- [ ] ...",
         "",
@@ -156,8 +162,9 @@ fn default_template_content() -> String {
         "2) Update the progress log at {{PROGRESS}} with status and next steps.",
         "3) If Linear is available, create or link a project + initial issues that mirror",
         "   the PRD and add the repo link.",
-        "4) Start the first actionable task.",
-        "5) Periodically push meaningful progress to GitHub (e.g., after each milestone).",
+        "4) If Linear cycles are available, align work to the active/next cycle and define a fringe list.",
+        "5) Start the first actionable task.",
+        "6) Periodically push meaningful progress to GitHub (e.g., after each milestone).",
         "",
     ]
     .join("\n")
@@ -428,11 +435,13 @@ fn truncate_string(input: &str, limit: usize) -> String {
 fn linear_context() -> Option<String> {
     let projects_query = "query Projects($first: Int!) { projects(first: $first) { nodes { id name description url } } }";
     let docs_query = "query Docs($first: Int!) { documents(first: $first) { nodes { id title url content project { name url } } } }";
-    let issues_query = "query Issues($first: Int!) { issues(first: $first) { nodes { id title url state { name } project { name url } } } }";
+    let issues_query = "query Issues($first: Int!) { issues(first: $first) { nodes { id title url state { name } project { name url } cycle { name startsAt endsAt } } } }";
+    let cycles_query = "query Cycles($first: Int!) { cycles(first: $first) { nodes { id name number startsAt endsAt isActive isCompleted team { name } } } }";
 
     let projects = linear_graphql(projects_query, serde_json::json!({ "first": 25 }))?;
     let docs = linear_graphql(docs_query, serde_json::json!({ "first": 10 }));
     let issues = linear_graphql(issues_query, serde_json::json!({ "first": 50 }));
+    let cycles = linear_graphql(cycles_query, serde_json::json!({ "first": 20 }));
 
     let mut parts = Vec::new();
     parts.push("Linear projects (raw JSON):".to_string());
@@ -444,6 +453,10 @@ fn linear_context() -> Option<String> {
     if let Some(issues_value) = issues {
         parts.push("Linear issues (raw JSON):".to_string());
         parts.push(truncate_string(&issues_value.to_string(), 20000));
+    }
+    if let Some(cycles_value) = cycles {
+        parts.push("Linear cycles (raw JSON):".to_string());
+        parts.push(truncate_string(&cycles_value.to_string(), 20000));
     }
     Some(parts.join("\n\n"))
 }
