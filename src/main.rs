@@ -41,6 +41,8 @@ struct Args {
     #[arg(long)]
     goal: Option<String>,
     #[arg(long)]
+    next_action: Option<String>,
+    #[arg(long)]
     specialization: Option<String>,
     #[arg(long, action = clap::ArgAction::Append)]
     runner_arg: Vec<String>,
@@ -78,12 +80,23 @@ fn prompt_for_goal(repo_name: &str) -> io::Result<String> {
     Ok(input.trim().to_string())
 }
 
+fn prompt_for_next_action() -> io::Result<String> {
+    println!("[ralph] What's the immediate next action you want taken?");
+    print!("[ralph] next action> ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    let _ = io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_string())
+}
+
 fn default_template_content() -> String {
     [
         "# Ralph loop bootstrap",
         "",
         "Goal context:",
         "{{GOAL}}",
+        "Next action:",
+        "{{NEXT_ACTION}}",
         "",
         "If the goal is unclear, briefly infer it from the repo and list any clarifying",
         "questions in the progress log before proceeding.",
@@ -357,14 +370,21 @@ fn extract_json_block(text: &str) -> Option<String> {
     Some(trimmed[start..=end].to_string())
 }
 
-fn parse_goal_from_output(output: &str) -> Option<String> {
+fn parse_goal_payload(output: &str) -> Option<(String, String)> {
     let candidate = extract_json_block(output)?;
     let value: Value = serde_json::from_str(&candidate).ok()?;
-    value
-        .get("goal")
+    let ultimate = value
+        .get("ultimate_goal")
+        .or_else(|| value.get("goal"))
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty())?;
+    let next_action = value
+        .get("next_action")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    Some((ultimate, next_action))
 }
 
 fn infer_goal_with_codex(
@@ -374,12 +394,12 @@ fn infer_goal_with_codex(
     effort: &str,
     yolo: bool,
     specialization: Option<&str>,
-) -> io::Result<Option<String>> {
+) -> io::Result<Option<(String, String)>> {
     let context = collect_repo_context(repo_name, cwd);
     let prompt = format!(
-        "You are a repo analyst. Infer the primary project goal.\n\
-Return ONLY JSON: {{\"goal\":\"...\"}}.\n\
-Rules: goal is one sentence, no markdown, no extra keys.\n\
+        "You are a repo analyst. Infer the ultimate project goal and the next concrete action.\n\
+Return ONLY JSON: {{\"ultimate_goal\":\"...\",\"next_action\":\"...\"}}.\n\
+Rules: both are single sentences, no markdown, no extra keys.\n\
 Think as long as needed before answering; output must be ONLY the JSON.\n\n\
 Context:\n{context}"
     );
@@ -395,7 +415,7 @@ Context:\n{context}"
         specialization,
     )?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    Ok(parse_goal_from_output(&stdout))
+    Ok(parse_goal_payload(&stdout))
 }
 
 fn ensure_file(path: &Path, content: &str) -> io::Result<()> {
@@ -568,6 +588,7 @@ fn main() -> io::Result<()> {
         .unwrap_or("repo");
 
     let mut goal = args.goal.unwrap_or_default();
+    let mut next_action = args.next_action.unwrap_or_default();
     if !prompt_template.is_file() {
         if goal.is_empty() {
             ensure_runner("codex")?;
@@ -579,23 +600,46 @@ fn main() -> io::Result<()> {
                 yolo,
                 specialization,
             )?
-                    .unwrap_or_else(|| {
-                        format!("Bootstrap {repo_name} with a PRD, progress log, and initial tasks.")
-                    });
-            println!("[ralph] Proposed goal: {guessed}");
-            let accepted = prompt_yes_no("[ralph] Use this goal?");
-            goal = match accepted {
-                Ok(true) => guessed,
-                Ok(false) => prompt_for_goal(repo_name)?,
-                Err(_) => guessed,
-            };
+            .unwrap_or_else(|| {
+                (
+                    format!("Bootstrap {repo_name} with a PRD, progress log, and initial tasks."),
+                    "Draft PRD and create initial tasks in Linear.".to_string(),
+                )
+            });
+            if goal.is_empty() {
+                println!("[ralph] Proposed ultimate goal: {}", guessed.0);
+                let accepted = prompt_yes_no("[ralph] Use this ultimate goal?");
+                goal = match accepted {
+                    Ok(true) => guessed.0.clone(),
+                    Ok(false) => prompt_for_goal(repo_name)?,
+                    Err(_) => guessed.0.clone(),
+                };
+            }
+            if next_action.is_empty() {
+                println!("[ralph] Proposed next action: {}", guessed.1);
+                let accepted = prompt_yes_no("[ralph] Use this next action?");
+                next_action = match accepted {
+                    Ok(true) => guessed.1.clone(),
+                    Ok(false) => prompt_for_next_action()?,
+                    Err(_) => guessed.1.clone(),
+                };
+            }
+        } else if next_action.is_empty() {
+            next_action = prompt_for_next_action()?;
         }
         let goal_text = if goal.is_empty() {
             "Goal: (unspecified) — infer from repo".to_string()
         } else {
             format!("Goal: {goal}")
         };
-        let template = default_template_content().replace("{{GOAL}}", &goal_text);
+        let next_action_text = if next_action.is_empty() {
+            "Next action: (unspecified)".to_string()
+        } else {
+            format!("{next_action}")
+        };
+        let template = default_template_content()
+            .replace("{{GOAL}}", &goal_text)
+            .replace("{{NEXT_ACTION}}", &next_action_text);
         ensure_file(&prompt_template, &template)?;
     }
 
@@ -605,7 +649,12 @@ fn main() -> io::Result<()> {
         } else {
             format!("# {repo_name} PRD\n\nGoal: {goal}\n")
         };
-        ensure_file(&prd_path, &prd_goal)?;
+        let prd_next = if next_action.is_empty() {
+            "Next action: (unspecified)\n".to_string()
+        } else {
+            format!("Next action: {next_action}\n")
+        };
+        ensure_file(&prd_path, &format!("{prd_goal}\n{prd_next}"))?;
     }
 
     if !progress_path.is_file() {
