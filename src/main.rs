@@ -70,23 +70,35 @@ fn load_prompt(template_path: &Path, prd_path: &Path, progress_path: &Path) -> i
 }
 
 fn prompt_for_goal(repo_name: &str) -> io::Result<String> {
-    println!(
-        "[ralph] No prompt template found. What's the goal for this repo ({repo_name})?"
-    );
-    print!("[ralph] goal> ");
-    io::stdout().flush()?;
-    let mut input = String::new();
-    let _ = io::stdin().read_line(&mut input)?;
-    Ok(input.trim().to_string())
+    loop {
+        println!(
+            "[ralph] No prompt template found. What's the goal for this repo ({repo_name})?"
+        );
+        print!("[ralph] goal> ");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        let _ = io::stdin().read_line(&mut input)?;
+        let trimmed = input.trim().to_string();
+        if !trimmed.is_empty() {
+            return Ok(trimmed);
+        }
+        println!("[ralph] Goal cannot be empty.");
+    }
 }
 
 fn prompt_for_next_action() -> io::Result<String> {
-    println!("[ralph] What's the immediate next action you want taken?");
-    print!("[ralph] next action> ");
-    io::stdout().flush()?;
-    let mut input = String::new();
-    let _ = io::stdin().read_line(&mut input)?;
-    Ok(input.trim().to_string())
+    loop {
+        println!("[ralph] What's the immediate next action you want taken?");
+        print!("[ralph] next action> ");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        let _ = io::stdin().read_line(&mut input)?;
+        let trimmed = input.trim().to_string();
+        if !trimmed.is_empty() {
+            return Ok(trimmed);
+        }
+        println!("[ralph] Next action cannot be empty.");
+    }
 }
 
 fn default_template_content() -> String {
