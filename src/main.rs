@@ -94,6 +94,44 @@ fn default_template_content() -> String {
     .join("\n")
 }
 
+fn prompt_yes_no(message: &str) -> io::Result<bool> {
+    print!("{message} [y/N] ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    let read = io::stdin().read_line(&mut input)?;
+    if read == 0 {
+        return Ok(false);
+    }
+    let answer = input.trim().to_lowercase();
+    Ok(answer == "y" || answer == "yes")
+}
+
+fn guess_goal(repo_name: &str, cwd: &Path) -> String {
+    let readme_candidates = ["README.md", "Readme.md", "readme.md"];
+    for name in readme_candidates {
+        let path = cwd.join(name);
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            for line in contents.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed.starts_with('#') {
+                    let title = trimmed.trim_start_matches('#').trim();
+                    if !title.is_empty() {
+                        return format!("{title} (bootstrap via Ralph)");
+                    }
+                }
+                if trimmed.len() > 8 {
+                    return format!("{trimmed} (bootstrap via Ralph)");
+                }
+                break;
+            }
+        }
+    }
+    format!("Bootstrap {repo_name} with a PRD, progress log, and initial tasks.")
+}
+
 fn ensure_file(path: &Path, content: &str) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         create_dir_all(parent)?;
@@ -257,7 +295,14 @@ fn main() -> io::Result<()> {
 
     let mut goal = String::new();
     if !prompt_template.is_file() {
-        goal = prompt_for_goal(repo_name)?;
+        let guessed = guess_goal(repo_name, &cwd);
+        println!("[ralph] Proposed goal: {guessed}");
+        let accepted = prompt_yes_no("[ralph] Use this goal?");
+        goal = match accepted {
+            Ok(true) => guessed,
+            Ok(false) => prompt_for_goal(repo_name)?,
+            Err(_) => guessed,
+        };
         let goal_text = if goal.is_empty() {
             "Goal: (unspecified) — infer from repo".to_string()
         } else {
