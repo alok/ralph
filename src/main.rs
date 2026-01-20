@@ -163,8 +163,9 @@ fn default_template_content() -> String {
         "3) If Linear is available, create or link a project + initial issues that mirror",
         "   the PRD and add the repo link.",
         "4) If Linear cycles are available, align work to the active/next cycle and define a fringe list.",
-        "5) Start the first actionable task.",
-        "6) Periodically push meaningful progress to GitHub (e.g., after each milestone).",
+        "5) Use Linear as the work queue: tag issues, move statuses, and keep cycle assignments current.",
+        "6) Start the first actionable task.",
+        "7) Periodically push meaningful progress to GitHub (e.g., after each milestone).",
         "",
     ]
     .join("\n")
