@@ -2,10 +2,12 @@ use clap::Parser;
 use serde_json::Value;
 use std::env;
 use std::fs::{create_dir_all, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use wait_timeout::ChildExt;
 
 #[derive(Parser, Debug)]
 #[command(name = "ralph", about = "Permissive Ralph loop runner")]
@@ -44,6 +46,14 @@ struct Args {
     next_action: Option<String>,
     #[arg(long)]
     specialization: Option<String>,
+    #[arg(long, default_value_t = true)]
+    codex_json: bool,
+    #[arg(long, default_value_t = 0)]
+    runner_timeout: u64,
+    #[arg(long, default_value_t = 24)]
+    sdk_max_turns: u32,
+    #[arg(long, default_value_t = true)]
+    ensure_mcp: bool,
     #[arg(long, action = clap::ArgAction::Append)]
     runner_arg: Vec<String>,
     #[arg(long)]
@@ -103,15 +113,36 @@ fn prompt_for_next_action() -> io::Result<String> {
 
 fn default_template_content() -> String {
     [
-        "# Ralph loop bootstrap",
+        "# [Ralph] {{GOAL}}",
         "",
-        "Goal context:",
+        "## Summary",
+        "Use this prompt like a GitHub issue. Keep scope tight and actionable.",
+        "",
+        "## Ultimate Goal (North Star)",
         "{{GOAL}}",
-        "Next action:",
+        "",
+        "## Proposed Next Action (Confirm Alignment)",
         "{{NEXT_ACTION}}",
         "",
-        "If the goal is unclear, briefly infer it from the repo and list any clarifying",
-        "questions in the progress log before proceeding.",
+        "## Context",
+        "- Repo context is provided below.",
+        "- Use MCP servers if available (especially `openaiDeveloperDocs` and `linear`).",
+        "",
+        "## Scope",
+        "- In scope:",
+        "- Out of scope:",
+        "",
+        "## Acceptance Criteria",
+        "- [ ] ...",
+        "",
+        "## Tasks",
+        "- [ ] ...",
+        "",
+        "## Risks / Open Questions",
+        "- ...",
+        "",
+        "## Links",
+        "- Linear project/doc links if available",
         "",
         "Tasks:",
         "1) Draft or update the PRD at {{PRD}} with goal, scope, milestones, risks.",
@@ -264,6 +295,92 @@ fn read_file_snippet(path: &Path, limit: usize) -> Option<String> {
     }
 }
 
+fn ensure_openai_docs_mcp() -> io::Result<()> {
+    let home = match env::var("HOME") {
+        Ok(value) => value,
+        Err(_) => return Ok(()),
+    };
+    let config_path = Path::new(&home).join(".codex/config.toml");
+    let mut content = std::fs::read_to_string(&config_path).unwrap_or_default();
+    if content.contains("[mcp_servers.openaiDeveloperDocs]") {
+        return Ok(());
+    }
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(
+        "\n[mcp_servers.openaiDeveloperDocs]\nurl = \"https://developers.openai.com/mcp\"\n",
+    );
+    if let Some(parent) = config_path.parent() {
+        create_dir_all(parent)?;
+    }
+    std::fs::write(config_path, content)?;
+    Ok(())
+}
+
+fn write_temp_file(prefix: &str, contents: &str) -> io::Result<PathBuf> {
+    let mut path = env::temp_dir();
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    path.push(format!("{prefix}-{ts}.txt"));
+    std::fs::write(&path, contents)?;
+    Ok(path)
+}
+
+fn run_process_with_timeout(
+    mut cmd: Command,
+    input: Option<&str>,
+    timeout: Option<Duration>,
+) -> io::Result<Output> {
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Some(text) = input {
+            stdin.write_all(text.as_bytes())?;
+        }
+    }
+
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+
+    let stdout_handle = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_handle = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+
+    let status = if let Some(timeout) = timeout {
+        match child.wait_timeout(timeout)? {
+            Some(status) => status,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "Runner timed out"));
+            }
+        }
+    } else {
+        child.wait()?
+    };
+
+    let stdout = stdout_handle.join().unwrap_or_default();
+    let stderr = stderr_handle.join().unwrap_or_default();
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 fn collect_repo_context(repo_name: &str, cwd: &Path) -> String {
     let mut lines = Vec::new();
     lines.push(format!("repo: {repo_name}"));
@@ -414,16 +531,12 @@ fn parse_goal_payload(output: &str) -> Option<(String, String)> {
     Some((ultimate, next_action))
 }
 
-fn infer_goal_with_codex(
+fn build_inference_prompt(
     repo_name: &str,
     cwd: &Path,
-    model: &str,
-    effort: &str,
-    yolo: bool,
-    specialization: Option<&str>,
     feedback: Option<&str>,
     previous: Option<(String, String)>,
-) -> io::Result<Option<(String, String)>> {
+) -> String {
     let context = collect_repo_context(repo_name, cwd);
     let mut prompt = format!(
         "You are a repo analyst. Infer the ultimate project goal and the next concrete action.\n\
@@ -441,6 +554,22 @@ Context:\n{context}"
     if let Some(note) = feedback {
         prompt.push_str(&format!("\n\nUser feedback:\n{note}\n"));
     }
+    prompt
+}
+
+fn infer_goal_with_codex(
+    repo_name: &str,
+    cwd: &Path,
+    model: &str,
+    effort: &str,
+    yolo: bool,
+    specialization: Option<&str>,
+    feedback: Option<&str>,
+    previous: Option<(String, String)>,
+    runner_timeout: Option<Duration>,
+    codex_json: bool,
+) -> io::Result<Option<(String, String)>> {
+    let prompt = build_inference_prompt(repo_name, cwd, feedback, previous);
     let output = run_codex(
         &prompt,
         model,
@@ -451,6 +580,32 @@ Context:\n{context}"
         false,
         None,
         specialization,
+        codex_json,
+        runner_timeout,
+    )?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    Ok(parse_goal_payload(&stdout))
+}
+
+fn infer_goal_with_sdk(
+    repo_name: &str,
+    cwd: &Path,
+    model: &str,
+    effort: &str,
+    specialization: Option<&str>,
+    feedback: Option<&str>,
+    previous: Option<(String, String)>,
+    sdk_max_turns: u32,
+    runner_timeout: Option<Duration>,
+) -> io::Result<Option<(String, String)>> {
+    let prompt = build_inference_prompt(repo_name, cwd, feedback, previous);
+    let output = run_sdk(
+        &prompt,
+        model,
+        effort,
+        specialization,
+        sdk_max_turns,
+        runner_timeout,
     )?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     Ok(parse_goal_payload(&stdout))
@@ -509,6 +664,8 @@ fn run_codex(
     resume_last: bool,
     resume_id: Option<&str>,
     specialization: Option<&str>,
+    codex_json: bool,
+    runner_timeout: Option<Duration>,
 ) -> io::Result<Output> {
     let mut cmd = Command::new("codex");
     if !model.is_empty() {
@@ -528,6 +685,11 @@ fn run_codex(
         cmd.arg("--full-auto");
     }
     cmd.arg("exec");
+    if codex_json {
+        cmd.arg("--json");
+    }
+    let output_path = write_temp_file("ralph-last-message", "")?;
+    cmd.args(["--output-last-message", output_path.to_string_lossy().as_ref()]);
     if resume_last || resume_id.is_some() {
         cmd.arg("resume");
         if let Some(id) = resume_id {
@@ -540,15 +702,13 @@ fn run_codex(
         cmd.args(runner_args);
     }
     cmd.arg("-");
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let mut child = cmd.spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(prompt.as_bytes())?;
+    let mut output = run_process_with_timeout(cmd, Some(prompt), runner_timeout)?;
+    if let Ok(message) = std::fs::read_to_string(&output_path) {
+        if !message.trim().is_empty() {
+            output.stdout = message.into_bytes();
+        }
     }
-    child.wait_with_output()
+    Ok(output)
 }
 
 fn has_arg(args: &[String], needle: &str) -> bool {
@@ -562,6 +722,7 @@ fn run_generic(
     prompt: &str,
     runner_args: &[String],
     yolo: bool,
+    runner_timeout: Option<Duration>,
 ) -> io::Result<Output> {
     let mut cmd = Command::new(runner);
     if !model.is_empty() {
@@ -575,10 +736,39 @@ fn run_generic(
         cmd.args(&args);
     }
     cmd.arg(prompt_flag).arg(prompt);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    cmd.output()
+    run_process_with_timeout(cmd, None, runner_timeout)
 }
 
+fn run_sdk(
+    prompt: &str,
+    model: &str,
+    effort: &str,
+    specialization: Option<&str>,
+    max_turns: u32,
+    runner_timeout: Option<Duration>,
+) -> io::Result<Output> {
+    let prompt_path = write_temp_file("ralph-prompt", prompt)?;
+    let mut cmd = Command::new("uv");
+    cmd.args([
+        "run",
+        "python",
+        "scripts/ralph_agent.py",
+        "--prompt-file",
+        prompt_path.to_string_lossy().as_ref(),
+        "--model",
+        model,
+        "--max-turns",
+        &max_turns.to_string(),
+        "--reasoning-effort",
+        effort,
+    ]);
+    if let Some(spec) = specialization {
+        if !spec.trim().is_empty() {
+            cmd.args(["--specialization", spec]);
+        }
+    }
+    run_process_with_timeout(cmd, None, runner_timeout)
+}
 fn ensure_runner(runner: &str) -> io::Result<()> {
     let found = which::which(runner).map_err(|_| {
         io::Error::new(
@@ -606,6 +796,12 @@ fn main() -> io::Result<()> {
     let sleep_secs = args.sleep;
     let max_seconds = args.max_seconds;
     let specialization = args.specialization.as_deref();
+    let codex_json = args.codex_json;
+    let runner_timeout = if args.runner_timeout > 0 {
+        Some(Duration::from_secs(args.runner_timeout))
+    } else {
+        None
+    };
     let prompt_template = args
         .prompt_template
         .unwrap_or_else(|| env_or_path("RALPH_PROMPT_TEMPLATE", default_template));
@@ -619,6 +815,11 @@ fn main() -> io::Result<()> {
     let stop_token = args.stop_token;
     let prompt_flag = args.prompt_flag;
     let yolo = !args.no_yolo;
+    let use_sdk = runner == "sdk";
+
+    if args.ensure_mcp {
+        let _ = ensure_openai_docs_mcp();
+    }
 
     let repo_name = cwd
         .file_name()
@@ -629,17 +830,37 @@ fn main() -> io::Result<()> {
     let mut next_action = args.next_action.unwrap_or_default();
     if !prompt_template.is_file() {
         if goal.is_empty() || next_action.is_empty() {
-            ensure_runner("codex")?;
-            let mut proposal = infer_goal_with_codex(
-                repo_name,
-                &cwd,
-                &model,
-                &reasoning_effort,
-                yolo,
-                specialization,
-                None,
-                None,
-            )?
+            if use_sdk {
+                ensure_runner("uv")?;
+            } else {
+                ensure_runner("codex")?;
+            }
+            let mut proposal = if use_sdk {
+                infer_goal_with_sdk(
+                    repo_name,
+                    &cwd,
+                    &model,
+                    &reasoning_effort,
+                    specialization,
+                    None,
+                    None,
+                    args.sdk_max_turns,
+                    runner_timeout,
+                )?
+            } else {
+                infer_goal_with_codex(
+                    repo_name,
+                    &cwd,
+                    &model,
+                    &reasoning_effort,
+                    yolo,
+                    specialization,
+                    None,
+                    None,
+                    runner_timeout,
+                    codex_json,
+                )?
+            }
             .unwrap_or_else(|| {
                 (
                     format!("Bootstrap {repo_name} with a PRD, progress log, and initial tasks."),
@@ -666,16 +887,32 @@ fn main() -> io::Result<()> {
                 }
 
                 let feedback = prompt_for_feedback()?;
-                let refined = infer_goal_with_codex(
-                    repo_name,
-                    &cwd,
-                    &model,
-                    &reasoning_effort,
-                    yolo,
-                    specialization,
-                    Some(&feedback),
-                    Some(proposal.clone()),
-                )?;
+                let refined = if use_sdk {
+                    infer_goal_with_sdk(
+                        repo_name,
+                        &cwd,
+                        &model,
+                        &reasoning_effort,
+                        specialization,
+                        Some(&feedback),
+                        Some(proposal.clone()),
+                        args.sdk_max_turns,
+                        runner_timeout,
+                    )?
+                } else {
+                    infer_goal_with_codex(
+                        repo_name,
+                        &cwd,
+                        &model,
+                        &reasoning_effort,
+                        yolo,
+                        specialization,
+                        Some(&feedback),
+                        Some(proposal.clone()),
+                        runner_timeout,
+                        codex_json,
+                    )?
+                };
                 match refined {
                     Some(pair) => proposal = pair,
                     None => {
@@ -727,7 +964,11 @@ fn main() -> io::Result<()> {
         ensure_file(&progress_path, &progress)?;
     }
 
-    ensure_runner(&runner)?;
+    if runner == "sdk" {
+        ensure_runner("uv")?;
+    } else {
+        ensure_runner(&runner)?;
+    }
 
     let mut prompt = load_prompt(&prompt_template, &prd_path, &progress_path)?;
     if let Some(extra) = args.extra.as_deref() {
@@ -744,30 +985,55 @@ fn main() -> io::Result<()> {
             break;
         }
         println!("[ralph] iteration {i}/{iterations}");
-        let output = if runner == "codex" {
-            run_codex(
-                &prompt,
-                &model,
-                &reasoning_effort,
-                &args.runner_arg,
-                args.full_auto,
-                yolo,
-                args.resume,
-                args.resume_id.as_deref(),
-                specialization,
-            )?
-        } else {
-            if (args.resume || args.resume_id.is_some()) && runner != "codex" {
-                eprintln!("[ralph] resume requested but runner is not codex; ignoring resume.");
+        let output = {
+            let result = if runner == "codex" {
+                run_codex(
+                    &prompt,
+                    &model,
+                    &reasoning_effort,
+                    &args.runner_arg,
+                    args.full_auto,
+                    yolo,
+                    args.resume,
+                    args.resume_id.as_deref(),
+                    specialization,
+                    codex_json,
+                    runner_timeout,
+                )
+            } else if use_sdk {
+                run_sdk(
+                    &prompt,
+                    &model,
+                    &reasoning_effort,
+                    specialization,
+                    args.sdk_max_turns,
+                    runner_timeout,
+                )
+            } else {
+                if (args.resume || args.resume_id.is_some()) && runner != "codex" {
+                    eprintln!("[ralph] resume requested but runner is not codex; ignoring resume.");
+                }
+                run_generic(
+                    &runner,
+                    &model,
+                    &prompt_flag,
+                    &prompt,
+                    &args.runner_arg,
+                    yolo,
+                    runner_timeout,
+                )
+            };
+            match result {
+                Ok(output) => output,
+                Err(err) => {
+                    if err.kind() == io::ErrorKind::TimedOut {
+                        stop_reason = Some("runner timed out".to_string());
+                        break;
+                    } else {
+                        return Err(err);
+                    }
+                }
             }
-            run_generic(
-                &runner,
-                &model,
-                &prompt_flag,
-                &prompt,
-                &args.runner_arg,
-                yolo,
-            )?
         };
 
         let stdout = output.stdout;
