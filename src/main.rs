@@ -382,14 +382,39 @@ fn write_temp_file(prefix: &str, contents: &str) -> io::Result<PathBuf> {
     Ok(path)
 }
 
+fn read_with_limit(mut reader: impl Read, limit: usize) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    while buf.len() < limit {
+        let remaining = limit - buf.len();
+        let read_size = chunk.len().min(remaining);
+        match reader.read(&mut chunk[..read_size]) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(_) => break,
+        }
+    }
+    buf
+}
+
 fn run_process_with_timeout(
     mut cmd: Command,
     input: Option<&str>,
     timeout: Option<Duration>,
+    capture_stdout: bool,
+    capture_stderr: bool,
 ) -> io::Result<Output> {
     cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(if capture_stdout {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stderr(if capture_stderr {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
     let mut child = cmd.spawn()?;
 
     if let Some(mut stdin) = child.stdin.take() {
@@ -398,19 +423,20 @@ fn run_process_with_timeout(
         }
     }
 
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
-
-    let stdout_handle = thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        buf
-    });
-    let stderr_handle = thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr.read_to_end(&mut buf);
-        buf
-    });
+    let stdout_handle = if capture_stdout {
+        child.stdout.take().map(|stdout| {
+            thread::spawn(move || read_with_limit(stdout, 2 * 1024 * 1024))
+        })
+    } else {
+        None
+    };
+    let stderr_handle = if capture_stderr {
+        child.stderr.take().map(|stderr| {
+            thread::spawn(move || read_with_limit(stderr, 2 * 1024 * 1024))
+        })
+    } else {
+        None
+    };
 
     let status = if let Some(timeout) = timeout {
         match child.wait_timeout(timeout)? {
@@ -425,8 +451,12 @@ fn run_process_with_timeout(
         child.wait()?
     };
 
-    let stdout = stdout_handle.join().unwrap_or_default();
-    let stderr = stderr_handle.join().unwrap_or_default();
+    let stdout = stdout_handle
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr_handle
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
     Ok(Output {
         status,
         stdout,
@@ -751,7 +781,13 @@ fn run_codex(
         cmd.args(runner_args);
     }
     cmd.arg("-");
-    let mut output = run_process_with_timeout(cmd, Some(prompt), runner_timeout)?;
+    let mut output = run_process_with_timeout(
+        cmd,
+        Some(prompt),
+        runner_timeout,
+        !codex_json,
+        true,
+    )?;
     if let Ok(message) = std::fs::read_to_string(&output_path) {
         if !message.trim().is_empty() {
             output.stdout = message.into_bytes();
@@ -785,7 +821,7 @@ fn run_generic(
         cmd.args(&args);
     }
     cmd.arg(prompt_flag).arg(prompt);
-    run_process_with_timeout(cmd, None, runner_timeout)
+    run_process_with_timeout(cmd, None, runner_timeout, true, true)
 }
 
 fn run_sdk(
@@ -816,7 +852,7 @@ fn run_sdk(
             cmd.args(["--specialization", spec]);
         }
     }
-    run_process_with_timeout(cmd, None, runner_timeout)
+    run_process_with_timeout(cmd, None, runner_timeout, true, true)
 }
 fn ensure_runner(runner: &str) -> io::Result<()> {
     let found = which::which(runner).map_err(|_| {
