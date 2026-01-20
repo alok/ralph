@@ -77,11 +77,22 @@ private def linearToken : IO (Option String) := do
 private def jsonObj (pairs : List (String × Json)) : Json :=
   Json.mkObj pairs
 
+private def authHeader (token : String) : String :=
+  let t :=
+    if token.startsWith "Bearer " then
+      token.drop 7
+    else
+      token
+  if t.startsWith "lin_api_" then
+    s!"Authorization: {t}"
+  else
+    s!"Authorization: Bearer {t}"
+
 private def graphql (token payload : String) : IO (Option Json) := do
   let args := #[
     "-sS",
     "-X", "POST",
-    "-H", s!"Authorization: Bearer {token}",
+    "-H", authHeader token,
     "-H", "Content-Type: application/json",
     "--data-binary", "@-",
     "https://api.linear.app/graphql"

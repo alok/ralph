@@ -4,7 +4,7 @@ use std::fs::{create_dir_all, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Parser, Debug)]
 #[command(name = "ralph", about = "Permissive Ralph loop runner")]
@@ -19,6 +19,8 @@ struct Args {
     iterations: u32,
     #[arg(long, default_value_t = 15)]
     sleep: u64,
+    #[arg(long, default_value_t = 0)]
+    max_seconds: u64,
     #[arg(long)]
     prompt_template: Option<PathBuf>,
     #[arg(long)]
@@ -33,6 +35,8 @@ struct Args {
     stop_token: String,
     #[arg(long, default_value = "-p")]
     prompt_flag: String,
+    #[arg(long)]
+    extra: Option<String>,
     #[arg(long, action = clap::ArgAction::Append)]
     runner_arg: Vec<String>,
     #[arg(long)]
@@ -190,6 +194,7 @@ fn main() -> io::Result<()> {
     let reasoning_effort = args.reasoning_effort;
     let iterations = args.iterations;
     let sleep_secs = args.sleep;
+    let max_seconds = args.max_seconds;
     let prompt_template = args
         .prompt_template
         .unwrap_or_else(|| env_or_path("RALPH_PROMPT_TEMPLATE", default_template));
@@ -224,10 +229,21 @@ fn main() -> io::Result<()> {
 
     ensure_runner(&runner)?;
 
-    let prompt = load_prompt(&prompt_template, &prd_path, &progress_path)?;
+    let mut prompt = load_prompt(&prompt_template, &prd_path, &progress_path)?;
+    if let Some(extra) = args.extra.as_deref() {
+        if !extra.trim().is_empty() {
+            prompt = format!("{extra}\n\n{prompt}");
+        }
+    }
     let yolo = !args.no_yolo;
+    let start = Instant::now();
+    let mut stop_reason: Option<String> = None;
 
     for i in 1..=iterations {
+        if max_seconds > 0 && start.elapsed().as_secs() >= max_seconds {
+            stop_reason = Some(format!("reached max runtime ({max_seconds}s)"));
+            break;
+        }
         println!("[ralph] iteration {i}/{iterations}");
         let output = if runner == "codex" {
             run_codex(
@@ -278,14 +294,20 @@ fn main() -> io::Result<()> {
 
         let stdout_text = String::from_utf8_lossy(&stdout);
         if stdout_text.contains(&stop_token) {
-            println!("[ralph] completion detected, stopping.");
+            stop_reason = Some("completion token detected".to_string());
             break;
         }
 
         if i < iterations {
             println!("[ralph] sleeping {sleep_secs}s before next iteration");
             std::thread::sleep(std::time::Duration::from_secs(sleep_secs));
+        } else {
+            stop_reason = Some("reached max iterations".to_string());
         }
+    }
+
+    if let Some(reason) = stop_reason {
+        println!("[ralph] stop: {reason}.");
     }
 
     Ok(())
