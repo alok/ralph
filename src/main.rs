@@ -229,8 +229,38 @@ fn is_noise_path_rename(path: &str) -> bool {
     is_noise_path(path)
 }
 
-fn filter_git_status_for_context(status: &str) -> String {
+fn looks_like_noise_cleanup(action: &str) -> bool {
+    let lower = action.to_ascii_lowercase();
+    let cleanup_terms = [
+        "clean", "cleanup", "remove", "delete", "gitignore", "untracked", "worktree",
+    ];
+    if !cleanup_terms.iter().any(|term| lower.contains(term)) {
+        return false;
+    }
+    let noise_terms = [
+        "data/",
+        "dataset",
+        ".cache",
+        "cache",
+        "raw_",
+        ".bin",
+        ".ubyte",
+        ".np",
+        "safetensors",
+        "ckpt",
+        "artifact",
+        "teenygrad",
+    ];
+    noise_terms.iter().any(|term| lower.contains(term))
+}
+
+fn noise_cleanup_feedback() -> &'static str {
+    "Do not propose cleanup of untracked dataset/cache artifacts unless referenced in TODO/progress/Linear or they block tests. Propose a code or test task based on active paths/TODOs."
+}
+
+fn filter_git_status_for_context(status: &str) -> (String, String) {
     let mut kept = Vec::new();
+    let mut ignored = Vec::new();
     for line in status.lines() {
         let trimmed = line.trim_start();
         if trimmed.is_empty() {
@@ -244,15 +274,17 @@ fn filter_git_status_for_context(status: &str) -> String {
             continue;
         }
         if is_noise_path_rename(path) {
+            ignored.push(path.to_string());
             continue;
         }
         kept.push(line.to_string());
     }
-    kept.join("\n")
+    (kept.join("\n"), ignored.join("\n"))
 }
 
-fn filter_diffstat_for_context(diffstat: &str) -> String {
+fn filter_diffstat_for_context(diffstat: &str) -> (String, String) {
     let mut kept = Vec::new();
+    let mut ignored = Vec::new();
     for line in diffstat.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -260,12 +292,13 @@ fn filter_diffstat_for_context(diffstat: &str) -> String {
         }
         if let Some((path, _rest)) = trimmed.split_once(" |") {
             if is_noise_path_rename(path.trim()) {
+                ignored.push(path.trim().to_string());
                 continue;
             }
         }
         kept.push(line.to_string());
     }
-    kept.join("\n")
+    (kept.join("\n"), ignored.join("\n"))
 }
 
 fn summarize_active_paths(diffstat: &str) -> Option<String> {
@@ -642,7 +675,7 @@ fn collect_repo_context(repo_name: &str, cwd: &Path) -> String {
     }
 
     let diff_stat_raw = run_command_output("git", &["diff", "--stat"], cwd).unwrap_or_default();
-    let diff_stat_filtered = filter_diffstat_for_context(&diff_stat_raw);
+    let (diff_stat_filtered, diff_stat_ignored) = filter_diffstat_for_context(&diff_stat_raw);
     if let Some(summary) = summarize_active_paths(&diff_stat_filtered) {
         lines.push(format!(
             "Active paths from diffstat (hint for next action): {summary}"
@@ -650,7 +683,7 @@ fn collect_repo_context(repo_name: &str, cwd: &Path) -> String {
     }
 
     let status_raw = run_command_output("git", &["status", "--short"], cwd).unwrap_or_default();
-    let status_filtered = filter_git_status_for_context(&status_raw);
+    let (status_filtered, status_ignored) = filter_git_status_for_context(&status_raw);
 
     append_context(
         &mut lines,
@@ -706,6 +739,18 @@ fn collect_repo_context(repo_name: &str, cwd: &Path) -> String {
         "worktree git diff --stat (use for next action)",
         non_empty_string(diff_stat_filtered),
         4000,
+    );
+    append_context(
+        &mut lines,
+        "worktree ignored dataset/cache artifacts (low priority unless referenced elsewhere)",
+        non_empty_string(status_ignored),
+        2000,
+    );
+    append_context(
+        &mut lines,
+        "diffstat ignored dataset/cache artifacts (low priority unless referenced elsewhere)",
+        non_empty_string(diff_stat_ignored),
+        2000,
     );
 
     lines.join("\n\n")
@@ -779,7 +824,8 @@ fn build_inference_prompt(
 Ultimate goal is a stable, long-horizon objective; next action is immediate and concrete.\n\
 Prioritize README/AGENTS/CLAUDE/PRD/Linear for the ultimate goal; ignore uncommitted diffs for the goal.\n\
 For next action, use worktree TODOs, git status/diff, and progress log; keep it small and concrete.\n\
-Ignore dataset/cache artifacts (data/, datasets/, .cache/, large binaries) when choosing next action.\n\
+Do not pick cleanup of ignored dataset/cache artifacts unless they are mentioned in TODO/progress/Linear or they block tests.\n\
+If ignored artifacts look like real work and are referenced elsewhere, call that out explicitly.\n\
 If active paths are listed, bias the next action toward that subproject when consistent with README/PRD.\n\
 If Linear context is present, only use entries that match the repo name or purpose.\n\
 Return ONLY JSON: {{\"ultimate_goal\":\"...\",\"next_action\":\"...\"}}.\n\
@@ -1100,7 +1146,7 @@ fn main() -> io::Result<()> {
             ensure_runner("codex")?;
         }
         let context = prepare_inference_context(repo_name, &cwd, context_log.as_deref())?;
-        let result = if use_sdk {
+        let mut result = if use_sdk {
             infer_goal_with_sdk(
                 &context,
                 &model,
@@ -1124,6 +1170,41 @@ fn main() -> io::Result<()> {
                 codex_json,
             )?
         };
+        if let Some((ultimate, action)) = result.clone() {
+            if looks_like_noise_cleanup(&action) {
+                let feedback = noise_cleanup_feedback();
+                result = if use_sdk {
+                    infer_goal_with_sdk(
+                        &context,
+                        &model,
+                        &reasoning_effort,
+                        specialization,
+                        Some(feedback),
+                        Some((ultimate, action)),
+                        args.sdk_max_turns,
+                        runner_timeout,
+                    )?
+                } else {
+                    infer_goal_with_codex(
+                        &context,
+                        &model,
+                        &reasoning_effort,
+                        yolo,
+                        specialization,
+                        Some(feedback),
+                        Some((ultimate, action)),
+                        runner_timeout,
+                        codex_json,
+                    )?
+                };
+            }
+        }
+        if let Some((ultimate, action)) = result.clone() {
+            if looks_like_noise_cleanup(&action) {
+                let fallback = "Review README/PRD/Linear and pick a concrete code or test task; avoid cleanup unless it blocks tests.";
+                result = Some((ultimate, fallback.to_string()));
+            }
+        }
         if let Some((ultimate, action)) = result {
             let output = serde_json::json!({
                 "ultimate_goal": ultimate,
@@ -1179,6 +1260,47 @@ fn main() -> io::Result<()> {
                     "Draft PRD and create initial tasks in Linear.".to_string(),
                 )
             });
+
+            let mut auto_attempts = 0;
+            while next_action.is_empty()
+                && looks_like_noise_cleanup(&proposal.1)
+                && auto_attempts < 2
+            {
+                let feedback = noise_cleanup_feedback();
+                let previous = Some((proposal.0.clone(), proposal.1.clone()));
+                let refined = if use_sdk {
+                    infer_goal_with_sdk(
+                        context,
+                        &model,
+                        &reasoning_effort,
+                        specialization,
+                        Some(feedback),
+                        previous,
+                        args.sdk_max_turns,
+                        runner_timeout,
+                    )?
+                } else {
+                    infer_goal_with_codex(
+                        context,
+                        &model,
+                        &reasoning_effort,
+                        yolo,
+                        specialization,
+                        Some(feedback),
+                        previous,
+                        runner_timeout,
+                        codex_json,
+                    )?
+                };
+                if let Some(next) = refined {
+                    proposal = next;
+                }
+                auto_attempts += 1;
+            }
+            if next_action.is_empty() && looks_like_noise_cleanup(&proposal.1) {
+                proposal.1 = "Review README/PRD/Linear and pick a concrete code or test task; avoid cleanup unless it blocks tests."
+                    .to_string();
+            }
 
             loop {
                 if goal.is_empty() {
