@@ -40,6 +40,8 @@ struct Args {
     extra: Option<String>,
     #[arg(long)]
     goal: Option<String>,
+    #[arg(long)]
+    specialization: Option<String>,
     #[arg(long, action = clap::ArgAction::Append)]
     runner_arg: Vec<String>,
     #[arg(long)]
@@ -122,6 +124,13 @@ fn run_command_output(cmd: &str, args: &[&str], cwd: &Path) -> Option<String> {
     }
 }
 
+fn append_context(lines: &mut Vec<String>, label: &str, value: Option<String>, limit: usize) {
+    if let Some(text) = value {
+        let truncated = truncate_string(&text, limit);
+        lines.push(format!("{label}:\n{truncated}"));
+    }
+}
+
 fn linear_token() -> Option<String> {
     for name in ["LINEAR_API_KEY", "LINEAR_TOKEN", "LINEAR_API_TOKEN"] {
         if let Ok(value) = env::var(name) {
@@ -196,16 +205,22 @@ fn truncate_string(input: &str, limit: usize) -> String {
 fn linear_context() -> Option<String> {
     let projects_query = "query Projects($first: Int!) { projects(first: $first) { nodes { id name description url } } }";
     let docs_query = "query Docs($first: Int!) { documents(first: $first) { nodes { id title url content project { name url } } } }";
+    let issues_query = "query Issues($first: Int!) { issues(first: $first) { nodes { id title url state { name } project { name url } } } }";
 
     let projects = linear_graphql(projects_query, serde_json::json!({ "first": 25 }))?;
     let docs = linear_graphql(docs_query, serde_json::json!({ "first": 10 }));
+    let issues = linear_graphql(issues_query, serde_json::json!({ "first": 50 }));
 
     let mut parts = Vec::new();
     parts.push("Linear projects (raw JSON):".to_string());
-    parts.push(truncate_string(&projects.to_string(), 4000));
+    parts.push(truncate_string(&projects.to_string(), 20000));
     if let Some(docs_value) = docs {
         parts.push("Linear documents (raw JSON):".to_string());
-        parts.push(truncate_string(&docs_value.to_string(), 4000));
+        parts.push(truncate_string(&docs_value.to_string(), 20000));
+    }
+    if let Some(issues_value) = issues {
+        parts.push("Linear issues (raw JSON):".to_string());
+        parts.push(truncate_string(&issues_value.to_string(), 20000));
     }
     Some(parts.join("\n\n"))
 }
@@ -229,39 +244,83 @@ fn collect_repo_context(repo_name: &str, cwd: &Path) -> String {
     lines.push(format!("repo: {repo_name}"));
     lines.push(format!("path: {}", cwd.display()));
 
-    if let Some(remote) = run_command_output("git", &["remote", "get-url", "origin"], cwd) {
-        lines.push(format!("git origin: {remote}"));
-    }
-    if let Some(status) = run_command_output("git", &["status", "--short"], cwd) {
-        lines.push(format!("git status:\n{status}"));
-    }
-    if let Some(last_commit) = run_command_output("git", &["log", "-1", "--oneline"], cwd) {
-        lines.push(format!("git last commit: {last_commit}"));
-    }
-    if let Some(files) = run_command_output("git", &["ls-files"], cwd) {
-        let mut snippet = files;
-        if snippet.len() > 2000 {
-            snippet.truncate(2000);
-            snippet.push_str("\n…");
-        }
-        lines.push(format!("tracked files:\n{snippet}"));
-    }
+    append_context(
+        &mut lines,
+        "git origin",
+        run_command_output("git", &["remote", "get-url", "origin"], cwd),
+        2000,
+    );
+    append_context(
+        &mut lines,
+        "git status",
+        run_command_output("git", &["status", "--short"], cwd),
+        4000,
+    );
+    append_context(
+        &mut lines,
+        "git last commit",
+        run_command_output("git", &["log", "-1", "--oneline"], cwd),
+        2000,
+    );
+    append_context(
+        &mut lines,
+        "git recent commits",
+        run_command_output("git", &["log", "-10", "--oneline"], cwd),
+        8000,
+    );
+    append_context(
+        &mut lines,
+        "git diff --stat",
+        run_command_output("git", &["diff", "--stat"], cwd),
+        4000,
+    );
+    append_context(
+        &mut lines,
+        "tracked files",
+        run_command_output("git", &["ls-files"], cwd),
+        20000,
+    );
 
     let readme_candidates = ["README.md", "Readme.md", "readme.md"];
     for name in readme_candidates {
         let path = cwd.join(name);
-        if let Some(snippet) = read_file_snippet(&path, 4000) {
+        if let Some(snippet) = read_file_snippet(&path, 20000) {
             lines.push(format!("README ({name}):\n{snippet}"));
             break;
         }
     }
 
-    for name in ["Cargo.toml", "lakefile.lean", "package.json", "pyproject.toml"] {
+    for name in ["AGENTS.md", "CLAUDE.md"] {
         let path = cwd.join(name);
-        if let Some(snippet) = read_file_snippet(&path, 1200) {
+        if let Some(snippet) = read_file_snippet(&path, 12000) {
             lines.push(format!("{name}:\n{snippet}"));
         }
     }
+
+    for name in ["Cargo.toml", "lakefile.lean", "package.json", "pyproject.toml"] {
+        let path = cwd.join(name);
+        if let Some(snippet) = read_file_snippet(&path, 8000) {
+            lines.push(format!("{name}:\n{snippet}"));
+        }
+    }
+
+    append_context(
+        &mut lines,
+        "rg TODO/FIXME/XXX",
+        run_command_output(
+            "rg",
+            &[
+                "-n",
+                "--max-count",
+                "200",
+                "-S",
+                "TODO|FIXME|XXX",
+                ".",
+            ],
+            cwd,
+        ),
+        12000,
+    );
 
     if let Some(linear) = linear_context() {
         lines.push(linear);
@@ -314,12 +373,14 @@ fn infer_goal_with_codex(
     model: &str,
     effort: &str,
     yolo: bool,
+    specialization: Option<&str>,
 ) -> io::Result<Option<String>> {
     let context = collect_repo_context(repo_name, cwd);
     let prompt = format!(
         "You are a repo analyst. Infer the primary project goal.\n\
 Return ONLY JSON: {{\"goal\":\"...\"}}.\n\
-Rules: goal is one sentence, no markdown, no extra keys.\n\n\
+Rules: goal is one sentence, no markdown, no extra keys.\n\
+Think as long as needed before answering; output must be ONLY the JSON.\n\n\
 Context:\n{context}"
     );
     let output = run_codex(
@@ -331,6 +392,7 @@ Context:\n{context}"
         yolo,
         false,
         None,
+        specialization,
     )?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     Ok(parse_goal_from_output(&stdout))
@@ -388,6 +450,7 @@ fn run_codex(
     yolo: bool,
     resume_last: bool,
     resume_id: Option<&str>,
+    specialization: Option<&str>,
 ) -> io::Result<Output> {
     let mut cmd = Command::new("codex");
     if !model.is_empty() {
@@ -395,6 +458,11 @@ fn run_codex(
     }
     if !effort.is_empty() {
         cmd.args(["-c", &format!("model_reasoning_effort={}", effort)]);
+    }
+    if let Some(spec) = specialization {
+        if !spec.trim().is_empty() {
+            cmd.args(["-c", &format!("specialization={}", spec)]);
+        }
     }
     if yolo {
         cmd.arg("--dangerously-bypass-approvals-and-sandbox");
@@ -479,6 +547,7 @@ fn main() -> io::Result<()> {
     let iterations = args.iterations;
     let sleep_secs = args.sleep;
     let max_seconds = args.max_seconds;
+    let specialization = args.specialization.as_deref();
     let prompt_template = args
         .prompt_template
         .unwrap_or_else(|| env_or_path("RALPH_PROMPT_TEMPLATE", default_template));
@@ -502,8 +571,14 @@ fn main() -> io::Result<()> {
     if !prompt_template.is_file() {
         if goal.is_empty() {
             ensure_runner("codex")?;
-            let guessed =
-                infer_goal_with_codex(repo_name, &cwd, &model, &reasoning_effort, yolo)?
+            let guessed = infer_goal_with_codex(
+                repo_name,
+                &cwd,
+                &model,
+                &reasoning_effort,
+                yolo,
+                specialization,
+            )?
                     .unwrap_or_else(|| {
                         format!("Bootstrap {repo_name} with a PRD, progress log, and initial tasks.")
                     });
@@ -567,6 +642,7 @@ fn main() -> io::Result<()> {
                 yolo,
                 args.resume,
                 args.resume_id.as_deref(),
+                specialization,
             )?
         } else {
             if (args.resume || args.resume_id.is_some()) && runner != "codex" {
