@@ -54,6 +54,12 @@ struct Args {
     sdk_max_turns: u32,
     #[arg(long, default_value_t = true)]
     ensure_mcp: bool,
+    #[arg(long)]
+    context_log: Option<PathBuf>,
+    #[arg(long, default_value_t = false)]
+    infer_only: bool,
+    #[arg(long, default_value_t = false)]
+    list_mcp: bool,
     #[arg(long, action = clap::ArgAction::Append)]
     runner_arg: Vec<String>,
     #[arg(long)]
@@ -318,6 +324,53 @@ fn ensure_openai_docs_mcp() -> io::Result<()> {
     Ok(())
 }
 
+fn list_mcp_servers() -> Vec<String> {
+    let home = match env::var("HOME") {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+    let config_path = Path::new(&home).join(".codex/config.toml");
+    let content = match std::fs::read_to_string(&config_path) {
+        Ok(data) => data,
+        Err(_) => return Vec::new(),
+    };
+    let mut servers = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("[mcp_servers.") && trimmed.ends_with(']') {
+            let name = trimmed
+                .trim_start_matches("[mcp_servers.")
+                .trim_end_matches(']');
+            if !name.is_empty() {
+                servers.push(name.to_string());
+            }
+        }
+    }
+    servers.sort();
+    servers.dedup();
+    servers
+}
+
+fn write_context_snapshot(path: &Path, context: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent)?;
+    }
+    std::fs::write(path, context)?;
+    Ok(())
+}
+
+fn prepare_inference_context(
+    repo_name: &str,
+    cwd: &Path,
+    context_log: Option<&Path>,
+) -> io::Result<String> {
+    let context = collect_repo_context(repo_name, cwd);
+    if let Some(path) = context_log {
+        let _ = write_context_snapshot(path, &context);
+    }
+    Ok(context)
+}
+
 fn write_temp_file(prefix: &str, contents: &str) -> io::Result<PathBuf> {
     let mut path = env::temp_dir();
     let ts = SystemTime::now()
@@ -532,12 +585,10 @@ fn parse_goal_payload(output: &str) -> Option<(String, String)> {
 }
 
 fn build_inference_prompt(
-    repo_name: &str,
-    cwd: &Path,
+    context: &str,
     feedback: Option<&str>,
     previous: Option<(String, String)>,
 ) -> String {
-    let context = collect_repo_context(repo_name, cwd);
     let mut prompt = format!(
         "You are a repo analyst. Infer the ultimate project goal and the next concrete action.\n\
 Return ONLY JSON: {{\"ultimate_goal\":\"...\",\"next_action\":\"...\"}}.\n\
@@ -558,8 +609,7 @@ Context:\n{context}"
 }
 
 fn infer_goal_with_codex(
-    repo_name: &str,
-    cwd: &Path,
+    context: &str,
     model: &str,
     effort: &str,
     yolo: bool,
@@ -569,7 +619,7 @@ fn infer_goal_with_codex(
     runner_timeout: Option<Duration>,
     codex_json: bool,
 ) -> io::Result<Option<(String, String)>> {
-    let prompt = build_inference_prompt(repo_name, cwd, feedback, previous);
+    let prompt = build_inference_prompt(context, feedback, previous);
     let output = run_codex(
         &prompt,
         model,
@@ -588,8 +638,7 @@ fn infer_goal_with_codex(
 }
 
 fn infer_goal_with_sdk(
-    repo_name: &str,
-    cwd: &Path,
+    context: &str,
     model: &str,
     effort: &str,
     specialization: Option<&str>,
@@ -598,7 +647,7 @@ fn infer_goal_with_sdk(
     sdk_max_turns: u32,
     runner_timeout: Option<Duration>,
 ) -> io::Result<Option<(String, String)>> {
-    let prompt = build_inference_prompt(repo_name, cwd, feedback, previous);
+    let prompt = build_inference_prompt(context, feedback, previous);
     let output = run_sdk(
         &prompt,
         model,
@@ -802,6 +851,10 @@ fn main() -> io::Result<()> {
     } else {
         None
     };
+    let context_log = args
+        .context_log
+        .clone()
+        .or_else(|| Some(cwd.join("ralph/context.txt")));
     let prompt_template = args
         .prompt_template
         .unwrap_or_else(|| env_or_path("RALPH_PROMPT_TEMPLATE", default_template));
@@ -821,6 +874,19 @@ fn main() -> io::Result<()> {
         let _ = ensure_openai_docs_mcp();
     }
 
+    if args.list_mcp {
+        let servers = list_mcp_servers();
+        if servers.is_empty() {
+            println!("No MCP servers configured.");
+        } else {
+            println!("Configured MCP servers:");
+            for name in servers {
+                println!("- {name}");
+            }
+        }
+        return Ok(());
+    }
+
     let repo_name = cwd
         .file_name()
         .and_then(|name| name.to_str())
@@ -828,6 +894,49 @@ fn main() -> io::Result<()> {
 
     let mut goal = args.goal.unwrap_or_default();
     let mut next_action = args.next_action.unwrap_or_default();
+    let mut inference_context: Option<String> = None;
+
+    if args.infer_only {
+        if use_sdk {
+            ensure_runner("uv")?;
+        } else {
+            ensure_runner("codex")?;
+        }
+        let context = prepare_inference_context(repo_name, &cwd, context_log.as_deref())?;
+        let result = if use_sdk {
+            infer_goal_with_sdk(
+                &context,
+                &model,
+                &reasoning_effort,
+                specialization,
+                None,
+                None,
+                args.sdk_max_turns,
+                runner_timeout,
+            )?
+        } else {
+            infer_goal_with_codex(
+                &context,
+                &model,
+                &reasoning_effort,
+                yolo,
+                specialization,
+                None,
+                None,
+                runner_timeout,
+                codex_json,
+            )?
+        };
+        if let Some((ultimate, action)) = result {
+            let output = serde_json::json!({
+                "ultimate_goal": ultimate,
+                "next_action": action
+            });
+            println!("{output}");
+            return Ok(());
+        }
+        return Err(io::Error::new(io::ErrorKind::Other, "Inference failed"));
+    }
     if !prompt_template.is_file() {
         if goal.is_empty() || next_action.is_empty() {
             if use_sdk {
@@ -835,10 +944,17 @@ fn main() -> io::Result<()> {
             } else {
                 ensure_runner("codex")?;
             }
-            let mut proposal = if use_sdk {
-                infer_goal_with_sdk(
+            if inference_context.is_none() {
+                inference_context = Some(prepare_inference_context(
                     repo_name,
                     &cwd,
+                    context_log.as_deref(),
+                )?);
+            }
+            let context = inference_context.as_ref().unwrap();
+            let mut proposal = if use_sdk {
+                infer_goal_with_sdk(
+                    context,
                     &model,
                     &reasoning_effort,
                     specialization,
@@ -849,8 +965,7 @@ fn main() -> io::Result<()> {
                 )?
             } else {
                 infer_goal_with_codex(
-                    repo_name,
-                    &cwd,
+                    context,
                     &model,
                     &reasoning_effort,
                     yolo,
@@ -889,8 +1004,7 @@ fn main() -> io::Result<()> {
                 let feedback = prompt_for_feedback()?;
                 let refined = if use_sdk {
                     infer_goal_with_sdk(
-                        repo_name,
-                        &cwd,
+                        context,
                         &model,
                         &reasoning_effort,
                         specialization,
@@ -901,8 +1015,7 @@ fn main() -> io::Result<()> {
                     )?
                 } else {
                     infer_goal_with_codex(
-                        repo_name,
-                        &cwd,
+                        context,
                         &model,
                         &reasoning_effort,
                         yolo,
