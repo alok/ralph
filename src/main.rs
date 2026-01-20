@@ -122,6 +122,94 @@ fn run_command_output(cmd: &str, args: &[&str], cwd: &Path) -> Option<String> {
     }
 }
 
+fn linear_token() -> Option<String> {
+    for name in ["LINEAR_API_KEY", "LINEAR_TOKEN", "LINEAR_API_TOKEN"] {
+        if let Ok(value) = env::var(name) {
+            let trimmed = value.trim().to_string();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+        }
+    }
+    let home = env::var("HOME").ok()?;
+    let config = Path::new(&home).join(".codex/config.toml");
+    let content = std::fs::read_to_string(config).ok()?;
+    if let Some(idx) = content.find("lin_api_") {
+        let tail = &content[idx..];
+        let token: String = tail
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        if !token.is_empty() {
+            return Some(token);
+        }
+    }
+    None
+}
+
+fn linear_auth_header(token: &str) -> String {
+    let mut t = token.trim().to_string();
+    if let Some(stripped) = t.strip_prefix("Bearer ") {
+        t = stripped.trim().to_string();
+    }
+    if t.starts_with("lin_api_") {
+        format!("Authorization: {t}")
+    } else {
+        format!("Authorization: Bearer {t}")
+    }
+}
+
+fn linear_graphql(query: &str, variables: Value) -> Option<Value> {
+    let token = linear_token()?;
+    let client = reqwest::blocking::Client::new();
+    let payload = serde_json::json!({
+        "query": query,
+        "variables": variables,
+    });
+    let resp = client
+        .post("https://api.linear.app/graphql")
+        .header("Content-Type", "application/json")
+        .header("Authorization", linear_auth_header(&token))
+        .json(&payload)
+        .send()
+        .ok()?;
+    let status = resp.status();
+    let value: Value = resp.json().ok()?;
+    if !status.is_success() {
+        return None;
+    }
+    if value.get("errors").is_some() {
+        return None;
+    }
+    Some(value)
+}
+
+fn truncate_string(input: &str, limit: usize) -> String {
+    if input.len() <= limit {
+        return input.to_string();
+    }
+    let mut out = input[..limit].to_string();
+    out.push_str("\n…");
+    out
+}
+
+fn linear_context() -> Option<String> {
+    let projects_query = "query Projects($first: Int!) { projects(first: $first) { nodes { id name description url } } }";
+    let docs_query = "query Docs($first: Int!) { documents(first: $first) { nodes { id title url content project { name url } } } }";
+
+    let projects = linear_graphql(projects_query, serde_json::json!({ "first": 25 }))?;
+    let docs = linear_graphql(docs_query, serde_json::json!({ "first": 10 }));
+
+    let mut parts = Vec::new();
+    parts.push("Linear projects (raw JSON):".to_string());
+    parts.push(truncate_string(&projects.to_string(), 4000));
+    if let Some(docs_value) = docs {
+        parts.push("Linear documents (raw JSON):".to_string());
+        parts.push(truncate_string(&docs_value.to_string(), 4000));
+    }
+    Some(parts.join("\n\n"))
+}
+
 fn read_file_snippet(path: &Path, limit: usize) -> Option<String> {
     let contents = std::fs::read_to_string(path).ok()?;
     let mut snippet = contents.trim().to_string();
@@ -147,6 +235,9 @@ fn collect_repo_context(repo_name: &str, cwd: &Path) -> String {
     if let Some(status) = run_command_output("git", &["status", "--short"], cwd) {
         lines.push(format!("git status:\n{status}"));
     }
+    if let Some(last_commit) = run_command_output("git", &["log", "-1", "--oneline"], cwd) {
+        lines.push(format!("git last commit: {last_commit}"));
+    }
     if let Some(files) = run_command_output("git", &["ls-files"], cwd) {
         let mut snippet = files;
         if snippet.len() > 2000 {
@@ -170,6 +261,12 @@ fn collect_repo_context(repo_name: &str, cwd: &Path) -> String {
         if let Some(snippet) = read_file_snippet(&path, 1200) {
             lines.push(format!("{name}:\n{snippet}"));
         }
+    }
+
+    if let Some(linear) = linear_context() {
+        lines.push(linear);
+    } else {
+        lines.push("Linear context: unavailable".to_string());
     }
 
     lines.join("\n\n")
@@ -404,6 +501,7 @@ fn main() -> io::Result<()> {
     let mut goal = args.goal.unwrap_or_default();
     if !prompt_template.is_file() {
         if goal.is_empty() {
+            ensure_runner("codex")?;
             let guessed =
                 infer_goal_with_codex(repo_name, &cwd, &model, &reasoning_effort, yolo)?
                     .unwrap_or_else(|| {
