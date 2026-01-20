@@ -1,5 +1,6 @@
 use clap::Parser;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::env;
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::{self, Read, Write};
@@ -183,6 +184,132 @@ fn run_command_output(cmd: &str, args: &[&str], cwd: &Path) -> Option<String> {
         None
     } else {
         Some(text)
+    }
+}
+
+fn is_noise_path(path: &str) -> bool {
+    let lower = path.trim().trim_matches('"').to_ascii_lowercase();
+    let trimmed = lower.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let noisy_dirs = [
+        "data/",
+        "datasets/",
+        ".cache/",
+        "cache/",
+        ".venv/",
+        "venv/",
+        "node_modules/",
+        "dist/",
+        "build/",
+        "target/",
+        "__pycache__/",
+    ];
+    for token in noisy_dirs {
+        if trimmed.starts_with(token) || trimmed.contains(&format!("/{token}")) {
+            return true;
+        }
+    }
+    let noisy_exts = [
+        ".bin", ".pt", ".pth", ".onnx", ".npz", ".npy", ".safetensors", ".ckpt", ".zip",
+        ".tar", ".gz", ".tgz", ".xz", ".bz2", ".7z", ".ubyte",
+    ];
+    if noisy_exts.iter().any(|ext| trimmed.ends_with(ext)) {
+        return true;
+    }
+    false
+}
+
+fn is_noise_path_rename(path: &str) -> bool {
+    if path.contains("->") {
+        let parts: Vec<&str> = path.split("->").collect();
+        return parts.iter().any(|p| is_noise_path(p));
+    }
+    is_noise_path(path)
+}
+
+fn filter_git_status_for_context(status: &str) -> String {
+    let mut kept = Vec::new();
+    for line in status.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.splitn(2, |c: char| c.is_whitespace());
+        let _flag = parts.next().unwrap_or("");
+        let path = parts.next().unwrap_or("").trim();
+        if path.is_empty() {
+            kept.push(line.to_string());
+            continue;
+        }
+        if is_noise_path_rename(path) {
+            continue;
+        }
+        kept.push(line.to_string());
+    }
+    kept.join("\n")
+}
+
+fn filter_diffstat_for_context(diffstat: &str) -> String {
+    let mut kept = Vec::new();
+    for line in diffstat.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some((path, _rest)) = trimmed.split_once(" |") {
+            if is_noise_path_rename(path.trim()) {
+                continue;
+            }
+        }
+        kept.push(line.to_string());
+    }
+    kept.join("\n")
+}
+
+fn summarize_active_paths(diffstat: &str) -> Option<String> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for line in diffstat.lines() {
+        let trimmed = line.trim();
+        let Some((path, _rest)) = trimmed.split_once(" |") else {
+            continue;
+        };
+        let path = path.trim();
+        if path.is_empty() {
+            continue;
+        }
+        let path = if path.contains("->") {
+            let parts: Vec<&str> = path.split("->").collect();
+            parts.last().unwrap_or(&path).trim()
+        } else {
+            path
+        };
+        let top = path.split('/').next().unwrap_or(path).trim();
+        if top.is_empty() {
+            continue;
+        }
+        *counts.entry(top.to_string()).or_insert(0) += 1;
+    }
+    if counts.is_empty() {
+        return None;
+    }
+    let mut items: Vec<(String, usize)> = counts.into_iter().collect();
+    items.sort_by(|a, b| b.1.cmp(&a.1));
+    let summary: Vec<String> = items
+        .into_iter()
+        .take(5)
+        .map(|(name, count)| format!("{name} ({count})"))
+        .collect();
+    Some(summary.join(", "))
+}
+
+fn non_empty_string(text: String) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
@@ -514,6 +641,17 @@ fn collect_repo_context(repo_name: &str, cwd: &Path) -> String {
         lines.push("Linear context: unavailable".to_string());
     }
 
+    let diff_stat_raw = run_command_output("git", &["diff", "--stat"], cwd).unwrap_or_default();
+    let diff_stat_filtered = filter_diffstat_for_context(&diff_stat_raw);
+    if let Some(summary) = summarize_active_paths(&diff_stat_filtered) {
+        lines.push(format!(
+            "Active paths from diffstat (hint for next action): {summary}"
+        ));
+    }
+
+    let status_raw = run_command_output("git", &["status", "--short"], cwd).unwrap_or_default();
+    let status_filtered = filter_git_status_for_context(&status_raw);
+
     append_context(
         &mut lines,
         "git origin",
@@ -560,13 +698,13 @@ fn collect_repo_context(repo_name: &str, cwd: &Path) -> String {
     append_context(
         &mut lines,
         "worktree git status (use for next action)",
-        run_command_output("git", &["status", "--short"], cwd),
+        non_empty_string(status_filtered),
         4000,
     );
     append_context(
         &mut lines,
         "worktree git diff --stat (use for next action)",
-        run_command_output("git", &["diff", "--stat"], cwd),
+        non_empty_string(diff_stat_filtered),
         4000,
     );
 
@@ -641,6 +779,8 @@ fn build_inference_prompt(
 Ultimate goal is a stable, long-horizon objective; next action is immediate and concrete.\n\
 Prioritize README/AGENTS/CLAUDE/PRD/Linear for the ultimate goal; ignore uncommitted diffs for the goal.\n\
 For next action, use worktree TODOs, git status/diff, and progress log; keep it small and concrete.\n\
+Ignore dataset/cache artifacts (data/, datasets/, .cache/, large binaries) when choosing next action.\n\
+If active paths are listed, bias the next action toward that subproject when consistent with README/PRD.\n\
 If Linear context is present, only use entries that match the repo name or purpose.\n\
 Return ONLY JSON: {{\"ultimate_goal\":\"...\",\"next_action\":\"...\"}}.\n\
 Rules: both are single sentences, no markdown, no extra keys.\n\
