@@ -38,6 +38,8 @@ struct Args {
     prompt_flag: String,
     #[arg(long)]
     extra: Option<String>,
+    #[arg(long)]
+    goal: Option<String>,
     #[arg(long, action = clap::ArgAction::Append)]
     runner_arg: Vec<String>,
     #[arg(long)]
@@ -399,17 +401,22 @@ fn main() -> io::Result<()> {
         .and_then(|name| name.to_str())
         .unwrap_or("repo");
 
-    let mut goal = String::new();
+    let mut goal = args.goal.unwrap_or_default();
     if !prompt_template.is_file() {
-        let guessed = infer_goal_with_codex(repo_name, &cwd, &model, &reasoning_effort, yolo)?
-            .unwrap_or_else(|| format!("Bootstrap {repo_name} with a PRD, progress log, and initial tasks."));
-        println!("[ralph] Proposed goal: {guessed}");
-        let accepted = prompt_yes_no("[ralph] Use this goal?");
-        goal = match accepted {
-            Ok(true) => guessed,
-            Ok(false) => prompt_for_goal(repo_name)?,
-            Err(_) => guessed,
-        };
+        if goal.is_empty() {
+            let guessed =
+                infer_goal_with_codex(repo_name, &cwd, &model, &reasoning_effort, yolo)?
+                    .unwrap_or_else(|| {
+                        format!("Bootstrap {repo_name} with a PRD, progress log, and initial tasks.")
+                    });
+            println!("[ralph] Proposed goal: {guessed}");
+            let accepted = prompt_yes_no("[ralph] Use this goal?");
+            goal = match accepted {
+                Ok(true) => guessed,
+                Ok(false) => prompt_for_goal(repo_name)?,
+                Err(_) => guessed,
+            };
+        }
         let goal_text = if goal.is_empty() {
             "Goal: (unspecified) — infer from repo".to_string()
         } else {
