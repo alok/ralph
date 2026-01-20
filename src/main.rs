@@ -62,6 +62,48 @@ fn load_prompt(template_path: &Path, prd_path: &Path, progress_path: &Path) -> i
         .replace("{{PROGRESS}}", &progress_ref))
 }
 
+fn prompt_for_goal(repo_name: &str) -> io::Result<String> {
+    println!(
+        "[ralph] No prompt template found. What's the goal for this repo ({repo_name})?"
+    );
+    print!("[ralph] goal> ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    let _ = io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_string())
+}
+
+fn default_template_content() -> String {
+    [
+        "# Ralph loop bootstrap",
+        "",
+        "Goal context:",
+        "{{GOAL}}",
+        "",
+        "If the goal is unclear, briefly infer it from the repo and list any clarifying",
+        "questions in the progress log before proceeding.",
+        "",
+        "Tasks:",
+        "1) Draft or update the PRD at {{PRD}} with goal, scope, milestones, risks.",
+        "2) Update the progress log at {{PROGRESS}} with status and next steps.",
+        "3) If Linear is available, create or link a project + initial issues that mirror",
+        "   the PRD and add the repo link.",
+        "4) Start the first actionable task.",
+        "",
+    ]
+    .join("\n")
+}
+
+fn ensure_file(path: &Path, content: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent)?;
+    }
+    if !path.exists() {
+        std::fs::write(path, content)?;
+    }
+    Ok(())
+}
+
 fn append_log(
     log_path: &Path,
     iteration: u32,
@@ -208,23 +250,37 @@ fn main() -> io::Result<()> {
     let stop_token = args.stop_token;
     let prompt_flag = args.prompt_flag;
 
+    let repo_name = cwd
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("repo");
+
+    let mut goal = String::new();
     if !prompt_template.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("Missing prompt template: {}", prompt_template.display()),
-        ));
+        goal = prompt_for_goal(repo_name)?;
+        let goal_text = if goal.is_empty() {
+            "Goal: (unspecified) — infer from repo".to_string()
+        } else {
+            format!("Goal: {goal}")
+        };
+        let template = default_template_content().replace("{{GOAL}}", &goal_text);
+        ensure_file(&prompt_template, &template)?;
     }
+
     if !prd_path.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("Missing PRD: {}", prd_path.display()),
-        ));
+        let prd_goal = if goal.is_empty() {
+            format!("# {repo_name} PRD\n\nGoal: (unspecified)\n")
+        } else {
+            format!("# {repo_name} PRD\n\nGoal: {goal}\n")
+        };
+        ensure_file(&prd_path, &prd_goal)?;
     }
+
     if !progress_path.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("Missing progress log: {}", progress_path.display()),
-        ));
+        let progress = format!(
+            "Initialized Ralph progress log for {repo_name}.\n"
+        );
+        ensure_file(&progress_path, &progress)?;
     }
 
     ensure_runner(&runner)?;
