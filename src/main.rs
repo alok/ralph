@@ -469,43 +469,6 @@ fn collect_repo_context(repo_name: &str, cwd: &Path) -> String {
     lines.push(format!("repo: {repo_name}"));
     lines.push(format!("path: {}", cwd.display()));
 
-    append_context(
-        &mut lines,
-        "git origin",
-        run_command_output("git", &["remote", "get-url", "origin"], cwd),
-        2000,
-    );
-    append_context(
-        &mut lines,
-        "git status",
-        run_command_output("git", &["status", "--short"], cwd),
-        4000,
-    );
-    append_context(
-        &mut lines,
-        "git last commit",
-        run_command_output("git", &["log", "-1", "--oneline"], cwd),
-        2000,
-    );
-    append_context(
-        &mut lines,
-        "git recent commits",
-        run_command_output("git", &["log", "-10", "--oneline"], cwd),
-        8000,
-    );
-    append_context(
-        &mut lines,
-        "git diff --stat",
-        run_command_output("git", &["diff", "--stat"], cwd),
-        4000,
-    );
-    append_context(
-        &mut lines,
-        "tracked files",
-        run_command_output("git", &["ls-files"], cwd),
-        20000,
-    );
-
     let readme_candidates = ["README.md", "Readme.md", "readme.md"];
     for name in readme_candidates {
         let path = cwd.join(name);
@@ -522,6 +485,22 @@ fn collect_repo_context(repo_name: &str, cwd: &Path) -> String {
         }
     }
 
+    for name in ["ralph/PRD.md", "PRD.md", "prd.md"] {
+        let path = cwd.join(name);
+        if let Some(snippet) = read_file_snippet(&path, 12000) {
+            lines.push(format!("PRD ({name}):\n{snippet}"));
+            break;
+        }
+    }
+
+    for name in ["ralph/progress.txt", "progress.txt"] {
+        let path = cwd.join(name);
+        if let Some(snippet) = read_file_snippet(&path, 8000) {
+            lines.push(format!("Ralph progress log ({name}):\n{snippet}"));
+            break;
+        }
+    }
+
     for name in ["Cargo.toml", "lakefile.lean", "package.json", "pyproject.toml"] {
         let path = cwd.join(name);
         if let Some(snippet) = read_file_snippet(&path, 8000) {
@@ -529,9 +508,40 @@ fn collect_repo_context(repo_name: &str, cwd: &Path) -> String {
         }
     }
 
+    if let Some(linear) = linear_context() {
+        lines.push(format!("Linear context (use for ultimate goal if relevant):\n{linear}"));
+    } else {
+        lines.push("Linear context: unavailable".to_string());
+    }
+
     append_context(
         &mut lines,
-        "rg TODO/FIXME/XXX",
+        "git origin",
+        run_command_output("git", &["remote", "get-url", "origin"], cwd),
+        2000,
+    );
+    append_context(
+        &mut lines,
+        "git last commit",
+        run_command_output("git", &["log", "-1", "--oneline"], cwd),
+        2000,
+    );
+    append_context(
+        &mut lines,
+        "git recent commits",
+        run_command_output("git", &["log", "-10", "--oneline"], cwd),
+        8000,
+    );
+    append_context(
+        &mut lines,
+        "tracked files",
+        run_command_output("git", &["ls-files"], cwd),
+        20000,
+    );
+
+    append_context(
+        &mut lines,
+        "worktree TODO/FIXME/XXX (use for next action)",
         run_command_output(
             "rg",
             &[
@@ -547,11 +557,18 @@ fn collect_repo_context(repo_name: &str, cwd: &Path) -> String {
         12000,
     );
 
-    if let Some(linear) = linear_context() {
-        lines.push(linear);
-    } else {
-        lines.push("Linear context: unavailable".to_string());
-    }
+    append_context(
+        &mut lines,
+        "worktree git status (use for next action)",
+        run_command_output("git", &["status", "--short"], cwd),
+        4000,
+    );
+    append_context(
+        &mut lines,
+        "worktree git diff --stat (use for next action)",
+        run_command_output("git", &["diff", "--stat"], cwd),
+        4000,
+    );
 
     lines.join("\n\n")
 }
@@ -621,6 +638,10 @@ fn build_inference_prompt(
 ) -> String {
     let mut prompt = format!(
         "You are a repo analyst. Infer the ultimate project goal and the next concrete action.\n\
+Ultimate goal is a stable, long-horizon objective; next action is immediate and concrete.\n\
+Prioritize README/AGENTS/CLAUDE/PRD/Linear for the ultimate goal; ignore uncommitted diffs for the goal.\n\
+For next action, use worktree TODOs, git status/diff, and progress log; keep it small and concrete.\n\
+If Linear context is present, only use entries that match the repo name or purpose.\n\
 Return ONLY JSON: {{\"ultimate_goal\":\"...\",\"next_action\":\"...\"}}.\n\
 Rules: both are single sentences, no markdown, no extra keys.\n\
 Think as long as needed before answering; output must be ONLY the JSON.\n\n\
