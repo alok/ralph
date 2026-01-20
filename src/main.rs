@@ -157,6 +157,7 @@ fn default_template_content() -> String {
         "3) If Linear is available, create or link a project + initial issues that mirror",
         "   the PRD and add the repo link.",
         "4) Start the first actionable task.",
+        "5) Periodically push meaningful progress to GitHub (e.g., after each milestone).",
         "",
     ]
     .join("\n")
