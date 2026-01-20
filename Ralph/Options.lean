@@ -8,6 +8,7 @@ structure Options where
   reasoningEffort : String := "xhigh"
   iterations : Nat := 24
   sleepSec : Nat := 15
+  maxSeconds : Nat := 0
   promptTemplate : Option System.FilePath := none
   prd : Option System.FilePath := none
   progress : Option System.FilePath := none
@@ -21,6 +22,7 @@ structure Options where
   fullAuto : Bool := false
   noYolo : Bool := false
   noLinear : Bool := false
+  extra : Option String := none
   deriving Repr
 
 /-- Fill in default paths relative to `cwd/ralph/` when none are provided. -/
