@@ -54,9 +54,13 @@ private def optsFromParsed (p : Parsed) : Options :=
   let stopToken : String := p.flag! "stop-token" |>.as! String
   let promptFlag : String := p.flag! "prompt-flag" |>.as! String
   let runnerArgs :=
-    match p.flag? "runner-arg" with
-    | some flag => (flag.as! (Array String)).toList
-    | none => []
+    p.flags.toList.foldl
+      (fun acc flag =>
+        if flag.flag.longName == "runner-arg" then
+          acc ++ (flag.as! (Array String)).toList
+        else
+          acc)
+      []
   let resume := p.hasFlag "resume" || p.hasFlag "resume-id"
   let resumeId :=
     match p.flag? "resume-id" with
@@ -142,7 +146,7 @@ def ralphCmd : Cmd := `[Cli|
     "no-log";                  "Disable log append."
     "stop-token" : String;     "Stop token string."
     "prompt-flag" : String;    "Runner prompt flag."
-    "runner-arg" : Array String; "Extra runner args (comma-separated)."
+    "runner-arg" : Array String; "Extra runner args (repeatable or comma-separated)."
     resume;                    "Resume most recent codex session."
     "resume-id" : String;      "Resume specific codex session id."
     "full-auto";               "Use codex --full-auto when yolo disabled."
