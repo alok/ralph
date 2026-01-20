@@ -382,6 +382,21 @@ fn extract_json_block(text: &str) -> Option<String> {
     Some(trimmed[start..=end].to_string())
 }
 
+fn prompt_for_feedback() -> io::Result<String> {
+    loop {
+        println!("[ralph] Provide corrections or desired direction for the goal/next action.");
+        print!("[ralph] feedback> ");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        let _ = io::stdin().read_line(&mut input)?;
+        let trimmed = input.trim().to_string();
+        if !trimmed.is_empty() {
+            return Ok(trimmed);
+        }
+        println!("[ralph] Feedback cannot be empty.");
+    }
+}
+
 fn parse_goal_payload(output: &str) -> Option<(String, String)> {
     let candidate = extract_json_block(output)?;
     let value: Value = serde_json::from_str(&candidate).ok()?;
@@ -406,15 +421,26 @@ fn infer_goal_with_codex(
     effort: &str,
     yolo: bool,
     specialization: Option<&str>,
+    feedback: Option<&str>,
+    previous: Option<(String, String)>,
 ) -> io::Result<Option<(String, String)>> {
     let context = collect_repo_context(repo_name, cwd);
-    let prompt = format!(
+    let mut prompt = format!(
         "You are a repo analyst. Infer the ultimate project goal and the next concrete action.\n\
 Return ONLY JSON: {{\"ultimate_goal\":\"...\",\"next_action\":\"...\"}}.\n\
 Rules: both are single sentences, no markdown, no extra keys.\n\
 Think as long as needed before answering; output must be ONLY the JSON.\n\n\
 Context:\n{context}"
     );
+    if let Some(prev) = previous {
+        prompt.push_str(&format!(
+            "\n\nPrevious proposal:\n- ultimate_goal: {}\n- next_action: {}\n",
+            prev.0, prev.1
+        ));
+    }
+    if let Some(note) = feedback {
+        prompt.push_str(&format!("\n\nUser feedback:\n{note}\n"));
+    }
     let output = run_codex(
         &prompt,
         model,
@@ -602,15 +628,17 @@ fn main() -> io::Result<()> {
     let mut goal = args.goal.unwrap_or_default();
     let mut next_action = args.next_action.unwrap_or_default();
     if !prompt_template.is_file() {
-        if goal.is_empty() {
+        if goal.is_empty() || next_action.is_empty() {
             ensure_runner("codex")?;
-            let guessed = infer_goal_with_codex(
+            let mut proposal = infer_goal_with_codex(
                 repo_name,
                 &cwd,
                 &model,
                 &reasoning_effort,
                 yolo,
                 specialization,
+                None,
+                None,
             )?
             .unwrap_or_else(|| {
                 (
@@ -618,26 +646,49 @@ fn main() -> io::Result<()> {
                     "Draft PRD and create initial tasks in Linear.".to_string(),
                 )
             });
-            if goal.is_empty() {
-                println!("[ralph] Proposed ultimate goal: {}", guessed.0);
-                let accepted = prompt_yes_no("[ralph] Use this ultimate goal?");
-                goal = match accepted {
-                    Ok(true) => guessed.0.clone(),
-                    Ok(false) => prompt_for_goal(repo_name)?,
-                    Err(_) => guessed.0.clone(),
-                };
+
+            loop {
+                if goal.is_empty() {
+                    println!("[ralph] Proposed ultimate goal: {}", proposal.0);
+                    if prompt_yes_no("[ralph] Use this ultimate goal?")? {
+                        goal = proposal.0.clone();
+                    }
+                }
+                if next_action.is_empty() {
+                    println!("[ralph] Proposed next action: {}", proposal.1);
+                    if prompt_yes_no("[ralph] Use this next action?")? {
+                        next_action = proposal.1.clone();
+                    }
+                }
+
+                if !goal.is_empty() && !next_action.is_empty() {
+                    break;
+                }
+
+                let feedback = prompt_for_feedback()?;
+                let refined = infer_goal_with_codex(
+                    repo_name,
+                    &cwd,
+                    &model,
+                    &reasoning_effort,
+                    yolo,
+                    specialization,
+                    Some(&feedback),
+                    Some(proposal.clone()),
+                )?;
+                match refined {
+                    Some(pair) => proposal = pair,
+                    None => {
+                        if goal.is_empty() {
+                            goal = prompt_for_goal(repo_name)?;
+                        }
+                        if next_action.is_empty() {
+                            next_action = prompt_for_next_action()?;
+                        }
+                        break;
+                    }
+                }
             }
-            if next_action.is_empty() {
-                println!("[ralph] Proposed next action: {}", guessed.1);
-                let accepted = prompt_yes_no("[ralph] Use this next action?");
-                next_action = match accepted {
-                    Ok(true) => guessed.1.clone(),
-                    Ok(false) => prompt_for_next_action()?,
-                    Err(_) => guessed.1.clone(),
-                };
-            }
-        } else if next_action.is_empty() {
-            next_action = prompt_for_next_action()?;
         }
         let goal_text = if goal.is_empty() {
             "Goal: (unspecified) — infer from repo".to_string()
