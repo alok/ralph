@@ -1,4 +1,5 @@
 use clap::Parser;
+use serde_json::Value;
 use std::env;
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::{self, Write};
@@ -106,30 +107,134 @@ fn prompt_yes_no(message: &str) -> io::Result<bool> {
     Ok(answer == "y" || answer == "yes")
 }
 
-fn guess_goal(repo_name: &str, cwd: &Path) -> String {
+fn run_command_output(cmd: &str, args: &[&str], cwd: &Path) -> Option<String> {
+    let out = Command::new(cmd).args(args).current_dir(cwd).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn read_file_snippet(path: &Path, limit: usize) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let mut snippet = contents.trim().to_string();
+    if snippet.len() > limit {
+        snippet.truncate(limit);
+        snippet.push_str("\n…");
+    }
+    if snippet.is_empty() {
+        None
+    } else {
+        Some(snippet)
+    }
+}
+
+fn collect_repo_context(repo_name: &str, cwd: &Path) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!("repo: {repo_name}"));
+    lines.push(format!("path: {}", cwd.display()));
+
+    if let Some(remote) = run_command_output("git", &["remote", "get-url", "origin"], cwd) {
+        lines.push(format!("git origin: {remote}"));
+    }
+    if let Some(status) = run_command_output("git", &["status", "--short"], cwd) {
+        lines.push(format!("git status:\n{status}"));
+    }
+    if let Some(files) = run_command_output("git", &["ls-files"], cwd) {
+        let mut snippet = files;
+        if snippet.len() > 2000 {
+            snippet.truncate(2000);
+            snippet.push_str("\n…");
+        }
+        lines.push(format!("tracked files:\n{snippet}"));
+    }
+
     let readme_candidates = ["README.md", "Readme.md", "readme.md"];
     for name in readme_candidates {
         let path = cwd.join(name);
-        if let Ok(contents) = std::fs::read_to_string(&path) {
-            for line in contents.lines() {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                if trimmed.starts_with('#') {
-                    let title = trimmed.trim_start_matches('#').trim();
-                    if !title.is_empty() {
-                        return format!("{title} (bootstrap via Ralph)");
-                    }
-                }
-                if trimmed.len() > 8 {
-                    return format!("{trimmed} (bootstrap via Ralph)");
-                }
-                break;
-            }
+        if let Some(snippet) = read_file_snippet(&path, 4000) {
+            lines.push(format!("README ({name}):\n{snippet}"));
+            break;
         }
     }
-    format!("Bootstrap {repo_name} with a PRD, progress log, and initial tasks.")
+
+    for name in ["Cargo.toml", "lakefile.lean", "package.json", "pyproject.toml"] {
+        let path = cwd.join(name);
+        if let Some(snippet) = read_file_snippet(&path, 1200) {
+            lines.push(format!("{name}:\n{snippet}"));
+        }
+    }
+
+    lines.join("\n\n")
+}
+
+fn extract_json_block(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.starts_with("```") {
+        let mut lines = trimmed.lines();
+        let _ = lines.next();
+        let mut body = String::new();
+        for line in lines {
+            if line.trim_start().starts_with("```") {
+                break;
+            }
+            body.push_str(line);
+            body.push('\n');
+        }
+        let body = body.trim().to_string();
+        if !body.is_empty() {
+            return Some(body);
+        }
+    }
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    Some(trimmed[start..=end].to_string())
+}
+
+fn parse_goal_from_output(output: &str) -> Option<String> {
+    let candidate = extract_json_block(output)?;
+    let value: Value = serde_json::from_str(&candidate).ok()?;
+    value
+        .get("goal")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn infer_goal_with_codex(
+    repo_name: &str,
+    cwd: &Path,
+    model: &str,
+    effort: &str,
+    yolo: bool,
+) -> io::Result<Option<String>> {
+    let context = collect_repo_context(repo_name, cwd);
+    let prompt = format!(
+        "You are a repo analyst. Infer the primary project goal.\n\
+Return ONLY JSON: {{\"goal\":\"...\"}}.\n\
+Rules: goal is one sentence, no markdown, no extra keys.\n\n\
+Context:\n{context}"
+    );
+    let output = run_codex(
+        &prompt,
+        model,
+        effort,
+        &[],
+        false,
+        yolo,
+        false,
+        None,
+    )?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    Ok(parse_goal_from_output(&stdout))
 }
 
 fn ensure_file(path: &Path, content: &str) -> io::Result<()> {
@@ -287,6 +392,7 @@ fn main() -> io::Result<()> {
         .unwrap_or_else(|| env_or_path("RALPH_LOG", default_log));
     let stop_token = args.stop_token;
     let prompt_flag = args.prompt_flag;
+    let yolo = !args.no_yolo;
 
     let repo_name = cwd
         .file_name()
@@ -295,7 +401,8 @@ fn main() -> io::Result<()> {
 
     let mut goal = String::new();
     if !prompt_template.is_file() {
-        let guessed = guess_goal(repo_name, &cwd);
+        let guessed = infer_goal_with_codex(repo_name, &cwd, &model, &reasoning_effort, yolo)?
+            .unwrap_or_else(|| format!("Bootstrap {repo_name} with a PRD, progress log, and initial tasks."));
         println!("[ralph] Proposed goal: {guessed}");
         let accepted = prompt_yes_no("[ralph] Use this goal?");
         goal = match accepted {
@@ -336,7 +443,6 @@ fn main() -> io::Result<()> {
             prompt = format!("{extra}\n\n{prompt}");
         }
     }
-    let yolo = !args.no_yolo;
     let start = Instant::now();
     let mut stop_reason: Option<String> = None;
 
