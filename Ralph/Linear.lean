@@ -25,6 +25,13 @@ structure LinearSync where
   doc : LinearDoc
   deriving Repr
 
+structure LinearCache where
+  repoName : String
+  repoUrl : String
+  project : LinearProject
+  doc : LinearDoc
+  deriving Repr
+
 private def runGit (args : Array String) (cwd? : Option System.FilePath := none) : IO (Option String) := do
   let out ← IO.Process.output { cmd := "git", args, cwd := cwd? } none
   if out.exitCode == 0 then
@@ -86,6 +93,18 @@ private def graphql (token payload : String) : IO (Option Json) := do
   | .ok j => return some j
   | .error _ => return none
 
+private def graphqlWithRetries (token payload : String) (retries : Nat := 2) : IO (Option Json) := do
+  let rec loop : Nat -> Nat -> IO (Option Json)
+    | 0, _ => graphql token payload
+    | n + 1, delaySec => do
+        let res ← graphql token payload
+        match res with
+        | some j => return some j
+        | none =>
+            IO.sleep (UInt32.ofNat delaySec)
+            loop n (delaySec * 2)
+  loop retries 1
+
 private def getObjVal? (j : Json) (k : String) : Option Json :=
   (j.getObjVal? k).toOption
 
@@ -116,6 +135,16 @@ private def parseProjects (j : Json) : List LinearProject :=
             some { id, name, description := desc, url }
         | _, _, _, _ => none
 
+private def parseDocNode (node : Json) : Option LinearDoc :=
+  let id? := getObjVal? node "id" >>= getStr?
+  let title? := getObjVal? node "title" >>= getStr?
+  let content? := getObjVal? node "content" >>= getStr?
+  let url? := getObjVal? node "url" >>= getStr?
+  match id?, title?, content?, url? with
+  | some id, some title, some content, some url =>
+      some { id, title, content, url }
+  | _, _, _, _ => none
+
 private def parseDocs (j : Json) : List LinearDoc :=
   let data? := getObjVal? j "data"
   let proj? := data? >>= fun d => getObjVal? d "project"
@@ -123,35 +152,102 @@ private def parseDocs (j : Json) : List LinearDoc :=
   let nodes? := docs? >>= fun p => getObjVal? p "nodes"
   match nodes? >>= getArr? with
   | none => []
-  | some arr =>
-      arr.toList.filterMap fun node =>
-        let id? := getObjVal? node "id" >>= getStr?
-        let title? := getObjVal? node "title" >>= getStr?
-        let content? := getObjVal? node "content" >>= getStr?
-        let url? := getObjVal? node "url" >>= getStr?
-        match id?, title?, content?, url? with
-        | some id, some title, some content, some url =>
-            some { id, title, content, url }
-        | _, _, _, _ => none
+  | some arr => arr.toList.filterMap parseDocNode
 
 private def parseDoc (j : Json) : Option LinearDoc :=
   let data? := getObjVal? j "data"
   let doc? := data? >>= fun d => getObjVal? d "documentCreate"
   let node? := doc? >>= fun d => getObjVal? d "document"
-  match node? with
-  | none => none
-  | some node =>
-      let id? := getObjVal? node "id" >>= getStr?
-      let title? := getObjVal? node "title" >>= getStr?
-      let content? := getObjVal? node "content" >>= getStr?
-      let url? := getObjVal? node "url" >>= getStr?
-      match id?, title?, content?, url? with
-      | some id, some title, some content, some url =>
-          some { id, title, content, url }
-      | _, _, _, _ => none
+  node? >>= parseDocNode
+
+private def parseDocById (j : Json) : Option LinearDoc :=
+  let data? := getObjVal? j "data"
+  let node? := data? >>= fun d => getObjVal? d "document"
+  node? >>= parseDocNode
 
 private def contains (haystack needle : String) : Bool :=
   haystack.toLower.toSlice.contains needle.toLower
+
+private def cachePath : IO System.FilePath := do
+  let xdg? ← IO.getEnv "XDG_CACHE_HOME"
+  let home? ← IO.getEnv "HOME"
+  let base :=
+    match xdg? with
+    | some path => System.FilePath.mk path
+    | none =>
+        match home? with
+        | some home => System.FilePath.mk home / ".cache"
+        | none => System.FilePath.mk ".cache"
+  return base / "ralph" / "linear_prd.json"
+
+private def cacheToJson (cache : LinearCache) : Json :=
+  jsonObj [
+    ("repoName", Json.str cache.repoName),
+    ("repoUrl", Json.str cache.repoUrl),
+    ("project", jsonObj [
+      ("id", Json.str cache.project.id),
+      ("name", Json.str cache.project.name),
+      ("description", Json.str cache.project.description),
+      ("url", Json.str cache.project.url)
+    ]),
+    ("doc", jsonObj [
+      ("id", Json.str cache.doc.id),
+      ("title", Json.str cache.doc.title),
+      ("content", Json.str cache.doc.content),
+      ("url", Json.str cache.doc.url)
+    ])
+  ]
+
+private def parseCache (j : Json) : Option LinearCache := do
+  let repoName ← getObjVal? j "repoName" >>= getStr?
+  let repoUrl := (getObjVal? j "repoUrl" >>= getStr?).getD ""
+  let proj ← getObjVal? j "project"
+  let projId ← getObjVal? proj "id" >>= getStr?
+  let projName ← getObjVal? proj "name" >>= getStr?
+  let projDesc ← getObjVal? proj "description" >>= getStr?
+  let projUrl ← getObjVal? proj "url" >>= getStr?
+  let doc ← getObjVal? j "doc"
+  let docId ← getObjVal? doc "id" >>= getStr?
+  let docTitle ← getObjVal? doc "title" >>= getStr?
+  let docContent ← getObjVal? doc "content" >>= getStr?
+  let docUrl ← getObjVal? doc "url" >>= getStr?
+  return {
+    repoName,
+    repoUrl,
+    project := { id := projId, name := projName, description := projDesc, url := projUrl },
+    doc := { id := docId, title := docTitle, content := docContent, url := docUrl }
+  }
+
+private def cacheMatches (cache : LinearCache) (repoName : String) (repoUrl? : Option String) : Bool :=
+  if cache.repoName == repoName then
+    true
+  else
+    match repoUrl? with
+    | some url =>
+        cache.repoUrl != "" && (contains cache.repoUrl url || contains url cache.repoUrl)
+    | none => false
+
+private def readCache (repoName : String) (repoUrl? : Option String) : IO (Option LinearCache) := do
+  let path ← cachePath
+  if !(← path.pathExists) then
+    return none
+  let content ← IO.FS.readFile path
+  match Json.parse content with
+  | .error _ => return none
+  | .ok j =>
+      let cache? := parseCache j
+      match cache? with
+      | some cache =>
+          if cacheMatches cache repoName repoUrl? then
+            return some cache
+          return none
+      | none => return none
+
+private def writeCache (cache : LinearCache) : IO Unit := do
+  let path ← cachePath
+  if let some parent := path.parent then
+    IO.FS.createDirAll parent
+  IO.FS.writeFile path (Json.compress (cacheToJson cache))
 
 private def projectScore (p : LinearProject) (repoName : String) (repoUrl? : Option String) : Nat :=
   let base := (if contains p.name repoName then 2 else 0) + (if contains p.description repoName then 1 else 0)
@@ -175,7 +271,7 @@ private def queryProjects (token : String) : IO (List LinearProject) := do
     "query Projects($first: Int!) { projects(first: $first) { nodes { id name description url } } }"
   let variables := jsonObj [("first", Json.num (JsonNumber.fromNat 50))]
   let payload := jsonObj [("query", Json.str query), ("variables", variables)] |> Json.compress
-  match (← graphql token payload) with
+  match (← graphqlWithRetries token payload) with
   | some j => return parseProjects j
   | none => return []
 
@@ -184,9 +280,18 @@ private def queryDocs (token : String) (projectId : String) : IO (List LinearDoc
     "query ProjectDocs($id: String!) { project(id: $id) { documents(first: 50) { nodes { id title content url } } } }"
   let variables := jsonObj [("id", Json.str projectId)]
   let payload := jsonObj [("query", Json.str query), ("variables", variables)] |> Json.compress
-  match (← graphql token payload) with
+  match (← graphqlWithRetries token payload) with
   | some j => return parseDocs j
   | none => return []
+
+private def queryDocById (token : String) (docId : String) : IO (Option LinearDoc) := do
+  let query :=
+    "query Document($id: String!) { document(id: $id) { id title content url } }"
+  let variables := jsonObj [("id", Json.str docId)]
+  let payload := jsonObj [("query", Json.str query), ("variables", variables)] |> Json.compress
+  match (← graphqlWithRetries token payload) with
+  | some j => return parseDocById j
+  | none => return none
 
 private def createDoc (token : String) (projectId title content : String) : IO (Option LinearDoc) := do
   let query :=
@@ -194,7 +299,7 @@ private def createDoc (token : String) (projectId title content : String) : IO (
   let input := jsonObj [("projectId", Json.str projectId), ("title", Json.str title), ("content", Json.str content)]
   let variables := jsonObj [("input", input)]
   let payload := jsonObj [("query", Json.str query), ("variables", variables)] |> Json.compress
-  match (← graphql token payload) with
+  match (← graphqlWithRetries token payload) with
   | some j => return parseDoc j
   | none => return none
 
@@ -212,6 +317,16 @@ def syncLinearPRD (opts : Options) : IO (Option LinearSync) := do
     | some root => root.fileName.getD "repo"
     | none => cwd.fileName.getD "repo"
   let repoUrl? ← runGit #["remote", "get-url", "origin"] repoRootPath
+  if let some cache ← readCache repoName repoUrl? then
+    let doc? ← queryDocById token cache.doc.id
+    let doc := doc?.getD cache.doc
+    let shouldUseCache := doc?.isSome || doc.content != ""
+    if shouldUseCache then
+      match opts.prd with
+      | some path => IO.FS.writeFile path doc.content
+      | none => pure ()
+      writeCache { cache with doc := doc }
+      return some { project := cache.project, doc := doc }
   let projects ← queryProjects token
   let some project := findProject projects repoName repoUrl? | return none
   let docs ← queryDocs token project.id
@@ -235,6 +350,7 @@ def syncLinearPRD (opts : Options) : IO (Option LinearSync) := do
   | some path =>
       IO.FS.writeFile path prdDoc.content
   | none => pure ()
+  writeCache { repoName, repoUrl := repoUrl?.getD "", project, doc := prdDoc }
   return some { project, doc := prdDoc }
 
 end Ralph
